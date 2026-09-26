@@ -1,0 +1,37 @@
+name: Build EXE Tauri
+
+on:
+  workflow_dispatch: # Mengizinkan Anda menekan tombol "Run" secara manual
+
+jobs:
+  build:
+    permissions:
+      contents: write # Izin agar GitHub bisa mengunggah file EXE
+    runs-on: windows-latest # Menggunakan OS Windows Server milik GitHub
+
+    steps:
+      - name: 1. Mengambil kode Anda
+        uses: actions/checkout@v4
+
+      - name: 2. Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 3. Install Dependensi Web (Frontend)
+        run: npm install
+        # Catatan: Jika Anda menggunakan yarn, ganti menjadi 'yarn install'
+        # Jika pnpm, ganti menjadi 'pnpm install'
+
+      - name: 4. Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 5. Merakit Aplikasi & Membuat File EXE
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: build-${{ github.run_id }}
+          releaseName: 'Hasil Build Windows'
+          releaseDraft: false
+          prerelease: false
