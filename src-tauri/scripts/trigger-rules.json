@@ -1,0 +1,21 @@
+{
+  "_petunjuk": "Edit isi 'rules' di bawah. 'keywords' = kata yang dicari di komentar (huruf kecil semua, tidak case-sensitive). 'reply' = jawaban yang dikirim kalau salah satu keyword ketemu. Urutan penting: sistem pakai rule PALING ATAS yang cocok duluan.",
+
+  "rules": [
+    {
+      "keywords": ["harga", "berapa", "price"],
+      "reply": "Halo kak, harga & link produknya ada di balasan pertama di bawah postingan ini ya 🙏"
+    },
+    {
+      "keywords": ["beli dimana", "link", "order", "cod"],
+      "reply": "Bisa langsung cek link di komentar pertama kak, atau klik keranjang kuning kalau ada 🛒"
+    },
+    {
+      "keywords": ["real", "ori", "asli", "garansi"],
+      "reply": "100% original kak, aman dan bergaransi resmi ya 😊"
+    }
+  ],
+
+  "fallback_reply": null,
+  "_catatan_fallback": "Kalau 'fallback_reply' diisi teks (bukan null), SEMUA komentar di post jualan yang gak cocok keyword manapun tetap akan dibalas pakai teks itu. Kalau dibiarkan null, komentar yang gak cocok keyword akan DI-SKIP (tidak dibalas)."
+}

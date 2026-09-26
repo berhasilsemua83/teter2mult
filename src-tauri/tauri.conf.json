@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "threads-automator",
+  "version": "0.2.2",
+  "identifier": "com.cerdas.threadsautomator",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Threads Automator - Pengaturan",
+        "width": 720,
+        "height": 800,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+  "active": true,
+  "targets": "all",
+  "icon": ["icons/icon.ico", "icons/icon.png"],
+  "windows": {
+    "nsis": {
+      "installerIcon": "icons/icon.ico"
+    }
+  }
+},
+  "plugins": {}
+}
