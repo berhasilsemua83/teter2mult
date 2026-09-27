@@ -6,7 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 
 const ENV_PATH = path.join(__dirname, '.env');
 const LOG_FILE = path.join(__dirname, 'refresh-token.log');
