@@ -3,7 +3,7 @@
 // Membaca pending-reply.json, dan mengirim reply yang sudah waktunya
 // (berisi teks tambahan + link affiliate) ke post utama terkait.
 
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
