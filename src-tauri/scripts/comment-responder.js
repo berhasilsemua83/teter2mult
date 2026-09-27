@@ -5,7 +5,7 @@
 // Komentar yang sudah pernah dibalas (replied-comments.json) tidak dibalas ulang.
 // Komentar pendek/emoji-doang otomatis di-skip (tidak dianggap perlu jawaban).
 
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
