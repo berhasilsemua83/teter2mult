@@ -3,7 +3,7 @@
 // Cara pakai: node reply-manual.js <POST_ID> "<teks balasan>"
 // Contoh   : node reply-manual.js 18125568880763963 "Ini balasan test saya"
 
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const axios = require('axios');
 
 const THREADS_USER_ID = process.env.THREADS_USER_ID;
