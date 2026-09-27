@@ -13,6 +13,23 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+// Bikin Command yang TIDAK menampilkan jendela console sekilas saat dijalankan
+// (dipakai untuk semua pemanggilan schtasks/where/npm dari background)
+fn hidden_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 // ====== SCRIPT DIEMBED LANGSUNG KE DALAM APLIKASI ======
 const SCRIPT_THREAD_POSTER: &str = include_str!("../scripts/thread-poster.js");
 const SCRIPT_REPLY_CHECKER: &str = include_str!("../scripts/reply-checker.js");
@@ -319,7 +336,7 @@ fn task_name_refresh_token(slug: &str) -> String {
 }
 
 fn run_schtasks(args: &[&str]) -> String {
-    let output = Command::new("schtasks").args(args).output();
+    let output = hidden_command("schtasks").args(args).output();
     match output {
         Ok(out) => {
             if out.status.success() {
@@ -334,7 +351,7 @@ fn run_schtasks(args: &[&str]) -> String {
 }
 
 fn delete_task_silent(name: &str) {
-    let _ = Command::new("schtasks").args(["/Delete", "/TN", name, "/F"]).output();
+    let _ = hidden_command("schtasks").args(["/Delete", "/TN", name, "/F"]).output();
 }
 
 // Dipanggil saat profil dihapus, supaya task-nya ikut hilang dari Task Scheduler
@@ -534,7 +551,7 @@ fn setup_project(app: tauri::AppHandle, profile: Profile) -> Result<Vec<String>,
 
     log.push(format!("Menjalankan npm install di {project} (bisa beberapa menit)..."));
 
-    let npm_output = Command::new(&npm_path).arg("install").current_dir(&project).output();
+    let npm_output = hidden_command(&npm_path).arg("install").current_dir(&project).output();
 
     match npm_output {
         Ok(out) => {
@@ -557,7 +574,7 @@ fn setup_project(app: tauri::AppHandle, profile: Profile) -> Result<Vec<String>,
 
 #[tauri::command]
 fn detect_node_path() -> Result<String, String> {
-    let output = Command::new("where")
+    let output = hidden_command("where")
         .arg("node")
         .output()
         .map_err(|e| format!("Gagal menjalankan 'where node': {e}"))?;
