@@ -9,7 +9,7 @@
 // "_reply.txt" untuk balasan berisi link affiliate, dikirim belakangan
 // lewat reply-checker.js (lihat pending-reply.json).
 
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
