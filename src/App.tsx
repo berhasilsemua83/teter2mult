@@ -80,6 +80,38 @@ const HARI_OPTIONS = [
   { value: "SUN", label: "Minggu" },
 ];
 
+// Tombol pilihan biasa sebagai pengganti <select> bawaan browser.
+// Popup <select> bisa tidak muncul di jendela aplikasi (terutama di RDP/OS lama),
+// tombol biasa tidak bergantung pada popup itu.
+function ChoiceButtons({
+  options,
+  value,
+  onChange,
+}: {
+  options: { value: string; label: string }[];
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="choice-row">
+      {options.map((o) => (
+        <button
+          type="button"
+          key={o.value}
+          className={`choice-btn ${o.value === value ? "active" : ""}`}
+          onClick={() => onChange(o.value)}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Penanda versi build, tampil di bawah judul supaya gampang dicek apakah
+// yang terpasang sudah versi terbaru.
+const APP_BUILD = "profil-v3";
+
 export default function App() {
   const [config, setConfig] = useState<Profile>(EMPTY_CONFIG);
   const [profileList, setProfileList] = useState<ProfileSummary[]>([]);
@@ -322,17 +354,24 @@ export default function App() {
             : "Belum Lengkap"}
         </div>
       </div>
-      <p className="subtitle">Pengaturan kredensial, perilaku sistem &amp; jadwal</p>
+      <p className="subtitle">
+        Pengaturan kredensial, perilaku sistem &amp; jadwal · build {APP_BUILD}
+      </p>
 
       {/* ===== PEMILIH PROFIL (MULTI AKUN) ===== */}
       <section>
         <h2>Profil Akun</h2>
-        <div className="key-input-group">
-          <select value={config.id} onChange={(e) => handleSwitchProfile(e.target.value)}>
-            {profileList.map((p) => (
-              <option key={p.id} value={p.id}>{p.name}</option>
-            ))}
-          </select>
+
+        <ChoiceButtons
+          options={profileList.map((p) => ({ value: p.id, label: p.name || "(tanpa nama)" }))}
+          value={config.id}
+          onChange={(id) => handleSwitchProfile(id)}
+        />
+        {profileList.length === 0 && (
+          <p className="hint">Daftar profil kosong atau belum termuat. Coba klik "+ Profil Baru".</p>
+        )}
+
+        <div className="key-input-group" style={{ marginTop: 10 }}>
           <button
             type="button"
             onClick={() => {
@@ -386,6 +425,8 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {status && <p className="status" style={{ marginTop: 10 }}>{status}</p>}
 
         <label className="field-label" style={{ marginTop: 12 }}>
           Nama Profil
@@ -544,14 +585,11 @@ export default function App() {
               Gaya Bahasa Balasan
               <span className="hint">Pilih template siap pakai, atau tulis sendiri</span>
             </label>
-            <select
+            <ChoiceButtons
+              options={STYLE_PRESET_OPTIONS}
               value={config.ai_style_preset}
-              onChange={(e) => setConfig({ ...config, ai_style_preset: e.target.value })}
-            >
-              {STYLE_PRESET_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>{opt.label}</option>
-              ))}
-            </select>
+              onChange={(v) => setConfig({ ...config, ai_style_preset: v })}
+            />
 
             <label className="field-label">
               Panjang Balasan (maksimal jumlah kalimat)
@@ -721,17 +759,14 @@ export default function App() {
           Refresh Token — Hari &amp; Jam
           <span className="hint">Cukup 1x seminggu</span>
         </label>
-        <div className="key-input-group">
-          <select
-            value={config.schedule.refresh_token_day}
-            onChange={(e) =>
-              setConfig({ ...config, schedule: { ...config.schedule, refresh_token_day: e.target.value } })
-            }
-          >
-            {HARI_OPTIONS.map((h) => (
-              <option key={h.value} value={h.value}>{h.label}</option>
-            ))}
-          </select>
+        <ChoiceButtons
+          options={HARI_OPTIONS}
+          value={config.schedule.refresh_token_day}
+          onChange={(v) =>
+            setConfig({ ...config, schedule: { ...config.schedule, refresh_token_day: v } })
+          }
+        />
+        <div className="key-input-group" style={{ marginTop: 8 }}>
           <input
             type="time"
             value={config.schedule.refresh_token_time}
