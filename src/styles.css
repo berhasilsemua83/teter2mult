@@ -216,7 +216,7 @@ input[readonly] {
 }
 
 .folder-picker-row button,
-button:not(.btn-remove):not(.btn-add):not(.btn-save) {
+button:not(.btn-remove):not(.btn-add):not(.btn-save):not(.choice-btn) {
   padding: 9px 14px;
   border-radius: 8px;
   border: 1px solid var(--card-border);
@@ -273,4 +273,33 @@ button:not(.btn-remove):not(.btn-add):not(.btn-save) {
 .log-fail {
   color: #fca5a5;
   margin-bottom: 4px;
+}
+
+/* Tombol pilihan (pengganti dropdown) */
+.choice-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.choice-btn {
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--card-border);
+  background: #14101c;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.choice-btn:hover {
+  border-color: var(--accent-purple);
+  color: #e4defc;
+}
+
+.choice-btn.active {
+  background: var(--gradient-main);
+  border-color: transparent;
+  color: #fff;
+  font-weight: 600;
 }
