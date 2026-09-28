@@ -42,6 +42,7 @@ const SCRIPT_PACKAGE_JSON: &str = include_str!("../scripts/package.json");
 // ====== STRUKTUR DATA ======
 
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)] 
 struct R2Config {
     account_id: String,
     access_key_id: String,
@@ -51,6 +52,7 @@ struct R2Config {
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)] 
 struct ScheduleConfig {
     thread_poster_times: Vec<String>,
     reply_checker_interval_minutes: u32,
@@ -61,6 +63,7 @@ struct ScheduleConfig {
 
 // Satu Profile = satu akun Threads lengkap dengan semua pengaturannya.
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)] 
 struct Profile {
     id: String,
     name: String,
