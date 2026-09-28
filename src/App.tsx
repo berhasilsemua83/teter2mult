@@ -89,6 +89,9 @@ export default function App() {
   const [settingUp, setSettingUp] = useState(false);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
+  const [showNewProfileForm, setShowNewProfileForm] = useState(false);
+  const [newProfileName, setNewProfileName] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   function normalizeProfile(loaded: Profile): Profile {
     if (!loaded.gemini_api_keys || loaded.gemini_api_keys.length === 0) {
@@ -138,15 +141,18 @@ export default function App() {
     }
   }
 
+  // Catatan: window.prompt / window.confirm tidak andal di jendela Tauri,
+  // jadi input nama profil dan konfirmasi hapus dibuat langsung di dalam UI.
   async function handleCreateProfile() {
-    const name = window.prompt("Nama profil baru (contoh: Akun Skincare, Akun Gadget):", "Profil Baru");
-    if (name === null) return; // dibatalkan
+    const name = newProfileName.trim() || "Profil Baru";
     try {
       const created = await invoke<Profile>("create_profile", { name });
       await refreshProfileList();
       setConfig(normalizeProfile(created));
       setScheduleLog([]);
       setSetupLog([]);
+      setShowNewProfileForm(false);
+      setNewProfileName("");
       setStatus(`Profil "${created.name}" dibuat.`);
     } catch (err) {
       setStatus(`Gagal membuat profil: ${err}`);
@@ -155,10 +161,6 @@ export default function App() {
 
   async function handleDeleteProfile() {
     if (!config.id) return;
-    const confirmed = window.confirm(
-      `Hapus profil "${config.name}"? Jadwal Task Scheduler milik profil ini juga akan dihapus. Tindakan ini tidak bisa dibatalkan.`
-    );
-    if (!confirmed) return;
 
     try {
       const remaining = await invoke<ProfileSummary[]>("delete_profile", { id: config.id });
@@ -167,11 +169,12 @@ export default function App() {
         const loaded = await invoke<Profile>("load_profile", { id: remaining[0].id });
         setConfig(normalizeProfile(loaded));
       } else {
-        // Semua profil terhapus -> minta buat baru
+        // Semua profil terhapus -> buat satu profil baru otomatis
         const created = await invoke<Profile>("create_profile", { name: "Profil 1" });
         await refreshProfileList();
         setConfig(normalizeProfile(created));
       }
+      setConfirmDelete(false);
       setStatus("Profil dihapus.");
     } catch (err) {
       setStatus(`Gagal menghapus profil: ${err}`);
@@ -330,11 +333,59 @@ export default function App() {
               <option key={p.id} value={p.id}>{p.name}</option>
             ))}
           </select>
-          <button type="button" onClick={handleCreateProfile}>+ Profil Baru</button>
-          <button type="button" className="btn-remove" onClick={handleDeleteProfile}>
+          <button
+            type="button"
+            onClick={() => {
+              setShowNewProfileForm(!showNewProfileForm);
+              setConfirmDelete(false);
+            }}
+          >
+            + Profil Baru
+          </button>
+          <button
+            type="button"
+            className="btn-remove"
+            onClick={() => {
+              setConfirmDelete(!confirmDelete);
+              setShowNewProfileForm(false);
+            }}
+          >
             Hapus Profil Ini
           </button>
         </div>
+
+        {showNewProfileForm && (
+          <div style={{ marginTop: 10 }}>
+            <label className="field-label">
+              Nama profil baru
+              <span className="hint">Contoh: Akun Skincare, Akun Gadget</span>
+            </label>
+            <div className="key-input-group">
+              <input
+                type="text"
+                placeholder="Nama profil"
+                value={newProfileName}
+                onChange={(e) => setNewProfileName(e.target.value)}
+              />
+              <button type="button" onClick={handleCreateProfile}>Buat Profil</button>
+            </div>
+          </div>
+        )}
+
+        {confirmDelete && (
+          <div style={{ marginTop: 10 }}>
+            <p className="hint" style={{ color: "#fca5a5" }}>
+              Hapus profil "{config.name}"? Jadwal Task Scheduler milik profil ini ikut dihapus dan
+              tidak bisa dibatalkan.
+            </p>
+            <div className="key-input-group">
+              <button type="button" className="btn-remove" onClick={handleDeleteProfile}>
+                Ya, hapus
+              </button>
+              <button type="button" onClick={() => setConfirmDelete(false)}>Batal</button>
+            </div>
+          </div>
+        )}
 
         <label className="field-label" style={{ marginTop: 12 }}>
           Nama Profil
