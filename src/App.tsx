@@ -39,6 +39,14 @@ interface ProfileSummary {
   name: string;
 }
 
+interface DashboardState {
+  last_post_id: string | null;
+  last_post_type: string | null;
+  last_post_time: string | null;
+  queue_count: number;
+  next_in_queue: string | null;
+}
+
 const EMPTY_CONFIG: Profile = {
   id: "",
   name: "",
@@ -80,9 +88,6 @@ const HARI_OPTIONS = [
   { value: "SUN", label: "Minggu" },
 ];
 
-// Tombol pilihan biasa sebagai pengganti <select> bawaan browser.
-// Popup <select> bisa tidak muncul di jendela aplikasi (terutama di RDP/OS lama),
-// tombol biasa tidak bergantung pada popup itu.
 function ChoiceButtons({
   options,
   value,
@@ -108,16 +113,51 @@ function ChoiceButtons({
   );
 }
 
-// Penanda versi build, tampil di bawah judul supaya gampang dicek apakah
-// yang terpasang sudah versi terbaru.
-const APP_BUILD = "profil-v3";
+const APP_BUILD = "profil-v4-dash";
+
+// Fungsi Matematika Waktu (Menghitung jadwal selanjutnya)
+function getNextScheduleInfo(times: string[]) {
+  if (!times || times.length === 0) return "Tidak ada jadwal";
+  
+  const now = new Date();
+  const currentTotal = now.getHours() * 60 + now.getMinutes();
+  
+  // Mengurutkan jadwal dari jam terkecil
+  const sorted = [...times].sort();
+
+  for (const t of sorted) {
+    const [h, m] = t.split(":").map(Number);
+    if ((h * 60 + m) > currentTotal) {
+      return `Hari ini, ${t} WIB`;
+    }
+  }
+  return `Besok, ${sorted[0]} WIB`;
+}
+
+// Fungsi Format Tanggal jadi ramah dibaca (Misal: "23 Jan, 14:00")
+function formatReadableDate(isoString: string) {
+  try {
+    const d = new Date(isoString);
+    return d.toLocaleString('id-ID', { 
+      day: 'numeric', 
+      month: 'short', 
+      hour: '2-digit', 
+      minute: '2-digit' 
+    }) + " WIB";
+  } catch {
+    return isoString;
+  }
+}
 
 export default function App() {
   const [config, setConfig] = useState<Profile>(EMPTY_CONFIG);
   const [profileList, setProfileList] = useState<ProfileSummary[]>([]);
+  const [dashboard, setDashboard] = useState<DashboardState | null>(null);
+  
   const [status, setStatus] = useState<string>("");
   const [scheduleLog, setScheduleLog] = useState<string[]>([]);
   const [setupLog, setSetupLog] = useState<string[]>([]);
+  
   const [settingUp, setSettingUp] = useState(false);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
@@ -138,18 +178,27 @@ export default function App() {
     return loaded;
   }
 
-  async function refreshProfileList() {
-    const list = await invoke<ProfileSummary[]>("list_profiles");
-    setProfileList(list);
-    return list;
+  // Fungsi khusus panggil data dashboard ke Rust
+  async function fetchDashboardData(profileId: string) {
+    if (!profileId) return;
+    try {
+      const data = await invoke<DashboardState>("get_dashboard_data", { profileId });
+      setDashboard(data);
+    } catch (e) {
+      console.error("Gagal ambil data dashboard:", e);
+    }
   }
 
   useEffect(() => {
     (async () => {
       try {
-        await refreshProfileList();
+        const list = await invoke<ProfileSummary[]>("list_profiles");
+        setProfileList(list);
         const active = await invoke<Profile>("get_active_profile");
         setConfig(normalizeProfile(active));
+        
+        // Ambil data dashboard untuk profil aktif
+        await fetchDashboardData(active.id);
       } catch (err) {
         setStatus(`Gagal memuat profil: ${err}`);
       } finally {
@@ -158,11 +207,25 @@ export default function App() {
     })();
   }, []);
 
+  // Timer: Refresh Dashboard setiap 10 detik otomatis
+  useEffect(() => {
+    if (config.id) {
+      const interval = setInterval(() => {
+        fetchDashboardData(config.id);
+      }, 10000);
+      return () => clearInterval(interval);
+    }
+  }, [config.id]);
+
   async function handleSwitchProfile(id: string) {
     setLoading(true);
     try {
       const loaded = await invoke<Profile>("load_profile", { id });
       setConfig(normalizeProfile(loaded));
+      
+      // Ambil data dashboard saat pindah profil
+      await fetchDashboardData(id);
+      
       setScheduleLog([]);
       setSetupLog([]);
       setStatus(`Pindah ke profil "${loaded.name}".`);
@@ -173,14 +236,16 @@ export default function App() {
     }
   }
 
-  // Catatan: window.prompt / window.confirm tidak andal di jendela Tauri,
-  // jadi input nama profil dan konfirmasi hapus dibuat langsung di dalam UI.
   async function handleCreateProfile() {
     const name = newProfileName.trim() || "Profil Baru";
     try {
       const created = await invoke<Profile>("create_profile", { name });
-      await refreshProfileList();
+      const list = await invoke<ProfileSummary[]>("list_profiles");
+      setProfileList(list);
+      
       setConfig(normalizeProfile(created));
+      await fetchDashboardData(created.id);
+      
       setScheduleLog([]);
       setSetupLog([]);
       setShowNewProfileForm(false);
@@ -197,15 +262,19 @@ export default function App() {
     try {
       const remaining = await invoke<ProfileSummary[]>("delete_profile", { id: config.id });
       setProfileList(remaining);
+      
       if (remaining.length > 0) {
         const loaded = await invoke<Profile>("load_profile", { id: remaining[0].id });
         setConfig(normalizeProfile(loaded));
+        await fetchDashboardData(loaded.id);
       } else {
-        // Semua profil terhapus -> buat satu profil baru otomatis
         const created = await invoke<Profile>("create_profile", { name: "Profil 1" });
-        await refreshProfileList();
+        const list = await invoke<ProfileSummary[]>("list_profiles");
+        setProfileList(list);
         setConfig(normalizeProfile(created));
+        await fetchDashboardData(created.id);
       }
+      
       setConfirmDelete(false);
       setStatus("Profil dihapus.");
     } catch (err) {
@@ -228,7 +297,8 @@ export default function App() {
     setStatus("Menyimpan...");
     try {
       await invoke("save_profile", { profile: cleanedConfig() });
-      await refreshProfileList(); // biar nama profil yang baru diubah ikut update di dropdown
+      const list = await invoke<ProfileSummary[]>("list_profiles");
+      setProfileList(list);
       setStatus("Pengaturan tersimpan.");
     } catch (err) {
       setStatus(`Gagal menyimpan: ${err}`);
@@ -243,6 +313,7 @@ export default function App() {
       const log = await invoke<string[]>("setup_project", { profile: cleanedConfig() });
       setSetupLog(log);
       setStatus("Setup selesai. Cek detail di bawah.");
+      
       const reloaded = await invoke<Profile>("load_profile", { id: config.id });
       setConfig(normalizeProfile(reloaded));
     } catch (err) {
@@ -259,7 +330,6 @@ export default function App() {
     try {
       const log = await invoke<string[]>("apply_schedule", { profile: cleanedConfig() });
       setScheduleLog(log);
-      await refreshProfileList();
       setStatus("Jadwal berhasil diterapkan. Cek detail di bawah.");
     } catch (err) {
       setStatus(`Gagal menerapkan jadwal: ${err}`);
@@ -355,10 +425,52 @@ export default function App() {
         </div>
       </div>
       <p className="subtitle">
-        Pengaturan kredensial, perilaku sistem &amp; jadwal · build {APP_BUILD}
+        Pengaturan kredensial &amp; jadwal · build {APP_BUILD}
       </p>
 
-      {/* ===== PEMILIH PROFIL (MULTI AKUN) ===== */}
+      {/* ==== DASHBOARD LIVE PANEL ==== */}
+      <div className="dashboard-panel">
+        <div className="dash-header">
+          Monitoring Bot 
+          <div className="live-badge">
+            <span className="live-dot"></span> REAL-TIME
+          </div>
+        </div>
+        
+        <div className="dash-grid">
+          <div className="dash-box">
+            <div className="dash-title">Terakhir Tayang</div>
+            <div className="dash-text">
+              {dashboard?.last_post_id ? (
+                <>
+                  <span className="dash-highlight">ID: {dashboard.last_post_id}</span>
+                  Tipe: {dashboard.last_post_type === "jualan" ? "🛒 Jualan" : "💬 Umum"}<br/>
+                  Pada: {formatReadableDate(dashboard.last_post_time || "")}
+                </>
+              ) : (
+                "Belum ada post yang tayang dari antrean"
+              )}
+            </div>
+          </div>
+          
+          <div className="dash-box">
+            <div className="dash-title">Antrean Selanjutnya</div>
+            <div className="dash-text">
+              {dashboard?.queue_count && dashboard.queue_count > 0 ? (
+                <>
+                  <span className="dash-highlight">Ada {dashboard.queue_count} konten siap tayang</span>
+                  Target file: "{dashboard.next_in_queue}"<br/>
+                  Jadwal: <span style={{color: "#86efac", fontWeight: "600"}}>{getNextScheduleInfo(config.schedule.thread_poster_times)}</span>
+                </>
+              ) : (
+                "Antrean kosong, mohon isi folder Queue agar bot bisa memposting."
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ===== PEMILIH PROFIL ===== */}
       <section>
         <h2>Profil Akun</h2>
 
@@ -426,13 +538,9 @@ export default function App() {
           </div>
         )}
 
-        {status && <p className="status" style={{ marginTop: 10 }}>{status}</p>}
-
         <label className="field-label" style={{ marginTop: 12 }}>
           Nama Profil
-          <span className="hint">
-            Dipakai sebagai penanda folder/jadwal, ganti sesuai akun (misal "Akun Skincare")
-          </span>
+          <span className="hint">Dipakai sebagai penanda folder/jadwal, ganti sesuai akun</span>
         </label>
         <input
           type="text"
@@ -444,24 +552,16 @@ export default function App() {
       {/* ===== THREADS ===== */}
       <section>
         <h2>Threads API</h2>
-        <label className="field-label">
-          Threads User ID
-          <span className="hint">ID akun Threads kamu (dari endpoint /me)</span>
-        </label>
+        <label className="field-label">Threads User ID</label>
         <input
           type="text"
-          placeholder="Contoh: 17841400..."
           value={config.threads_user_id}
           onChange={(e) => setConfig({ ...config, threads_user_id: e.target.value })}
         />
 
-        <label className="field-label">
-          Threads Access Token
-          <span className="hint">Long-lived token, direfresh otomatis tiap minggu</span>
-        </label>
+        <label className="field-label">Threads Access Token</label>
         <input
           type="password"
-          placeholder="Token panjang dari Meta Developer"
           value={config.threads_access_token}
           onChange={(e) => setConfig({ ...config, threads_access_token: e.target.value })}
         />
@@ -470,83 +570,51 @@ export default function App() {
       {/* ===== CLOUDFLARE R2 ===== */}
       <section>
         <h2>Cloudflare R2 (hosting video/gambar)</h2>
-
-        <label className="field-label">
-          Cloudflare Account ID
-          <span className="hint">Dari dashboard Cloudflare, menu R2</span>
-        </label>
+        <label className="field-label">Cloudflare Account ID</label>
         <input
           type="text"
-          placeholder="Contoh: a1b2c3d4e5f6..."
           value={config.r2.account_id}
           onChange={(e) => setConfig({ ...config, r2: { ...config.r2, account_id: e.target.value } })}
         />
 
-        <label className="field-label">
-          R2 Access Key ID
-          <span className="hint">Dari "Manage R2 API Tokens" saat membuat token</span>
-        </label>
+        <label className="field-label">R2 Access Key ID</label>
         <input
           type="text"
-          placeholder="R2 Access Key ID"
           value={config.r2.access_key_id}
           onChange={(e) => setConfig({ ...config, r2: { ...config.r2, access_key_id: e.target.value } })}
         />
 
-        <label className="field-label">
-          R2 Secret Access Key
-          <span className="hint">Jaga kerahasiaannya, hanya muncul sekali saat dibuat</span>
-        </label>
+        <label className="field-label">R2 Secret Access Key</label>
         <input
           type="password"
-          placeholder="R2 Secret Access Key"
           value={config.r2.secret_access_key}
           onChange={(e) => setConfig({ ...config, r2: { ...config.r2, secret_access_key: e.target.value } })}
         />
 
-        <label className="field-label">
-          Nama Bucket
-          <span className="hint">Nama bucket R2 yang kamu buat, contoh: threads-media</span>
-        </label>
+        <label className="field-label">Nama Bucket</label>
         <input
           type="text"
-          placeholder="threads-media"
           value={config.r2.bucket_name}
           onChange={(e) => setConfig({ ...config, r2: { ...config.r2, bucket_name: e.target.value } })}
         />
 
-        <label className="field-label">
-          Public URL Base
-          <span className="hint">URL publik dari bucket, contoh: https://pub-xxxxx.r2.dev (tanpa garis miring di akhir)</span>
-        </label>
+        <label className="field-label">Public URL Base</label>
         <input
           type="text"
-          placeholder="https://pub-xxxxxxxx.r2.dev"
           value={config.r2.public_url_base}
           onChange={(e) => setConfig({ ...config, r2: { ...config.r2, public_url_base: e.target.value } })}
         />
       </section>
 
-      {/* ===== GEMINI (MULTI KEY) ===== */}
+      {/* ===== GEMINI ===== */}
       <section>
         <h2>Gemini API Key (untuk balasan AI)</h2>
-        <p className="hint">
-          Bisa isi lebih dari satu — kalau key pertama kuotanya habis, sistem otomatis
-          coba key berikutnya secara berurutan.
-        </p>
-
         {config.gemini_api_keys.map((key, index) => (
           <div className="gemini-key-row" key={index}>
-            <label className="field-label">
-              Gemini API Key #{index + 1}
-              <span className="hint">
-                {index === 0 ? "Dicoba pertama kali" : `Cadangan urutan ke-${index + 1}`}
-              </span>
-            </label>
+            <label className="field-label">Gemini API Key #{index + 1}</label>
             <div className="key-input-group">
               <input
                 type="password"
-                placeholder={`Tempel Gemini API Key ke-${index + 1} di sini`}
                 value={key}
                 onChange={(e) => updateGeminiKey(index, e.target.value)}
               />
@@ -581,19 +649,14 @@ export default function App() {
 
         {config.ai_reply_enabled && (
           <>
-            <label className="field-label" style={{ marginTop: 16 }}>
-              Gaya Bahasa Balasan
-              <span className="hint">Pilih template siap pakai, atau tulis sendiri</span>
-            </label>
+            <label className="field-label" style={{ marginTop: 16 }}>Gaya Bahasa Balasan</label>
             <ChoiceButtons
               options={STYLE_PRESET_OPTIONS}
               value={config.ai_style_preset}
               onChange={(v) => setConfig({ ...config, ai_style_preset: v })}
             />
 
-            <label className="field-label">
-              Panjang Balasan (maksimal jumlah kalimat)
-            </label>
+            <label className="field-label">Panjang Balasan (maksimal kalimat)</label>
             <input
               type="number"
               min={1}
@@ -602,23 +665,9 @@ export default function App() {
               onChange={(e) => setConfig({ ...config, ai_max_sentences: Number(e.target.value) })}
             />
 
-            <label className="field-label">
-              {config.ai_style_preset === "custom"
-                ? "Instruksi Gaya Bahasa (wajib diisi karena pilih Custom)"
-                : "Aturan Tambahan (opsional)"}
-              <span className="hint">
-                {config.ai_style_preset === "custom"
-                  ? "Tulis bebas gaya bahasa yang kamu mau, contoh: \"Gunakan bahasa Jawa halus, sedikit humor\""
-                  : "Ditambahkan sebagai aturan ekstra di atas template yang dipilih"}
-              </span>
-            </label>
+            <label className="field-label">Instruksi Tambahan</label>
             <textarea
               rows={3}
-              placeholder={
-                config.ai_style_preset === "custom"
-                  ? "Contoh: Gaya bahasa hangat seperti kakak online shop, selalu sebut 'kak' di awal kalimat..."
-                  : "Contoh: selalu sebut nama brand di akhir kalimat"
-              }
               value={config.ai_custom_instruction}
               onChange={(e) => setConfig({ ...config, ai_custom_instruction: e.target.value })}
             />
@@ -629,13 +678,13 @@ export default function App() {
       {/* ===== FOLDER KONTEN ===== */}
       <section>
         <h2>Folder Konten</h2>
-        <label className="field-label">Folder Queue (stok konten baru)</label>
+        <label className="field-label">Folder Queue</label>
         <div className="folder-picker-row">
           <input type="text" readOnly value={config.queue_folder} placeholder="Belum dipilih" />
           <button type="button" onClick={() => pickFolder("queue_folder")}>Pilih Folder</button>
         </div>
 
-        <label className="field-label">Folder Posted (arsip yang sudah tayang)</label>
+        <label className="field-label">Folder Posted</label>
         <div className="folder-picker-row">
           <input type="text" readOnly value={config.posted_folder} placeholder="Belum dipilih" />
           <button type="button" onClick={() => pickFolder("posted_folder")}>Pilih Folder</button>
@@ -646,24 +695,17 @@ export default function App() {
       <section>
         <h2>Lokasi Program</h2>
 
-        <label className="field-label">
-          Path node.exe
-          <span className="hint">Biasanya: C:\Program Files\nodejs\node.exe</span>
-        </label>
+        <label className="field-label">Path node.exe</label>
         <div className="folder-picker-row">
           <input
             type="text"
             value={config.node_exe_path}
-            placeholder="C:\Program Files\nodejs\node.exe"
             onChange={(e) => setConfig({ ...config, node_exe_path: e.target.value })}
           />
           <button type="button" onClick={handleDetectNode}>Deteksi Otomatis</button>
         </div>
 
-        <label className="field-label">
-          Folder Proyek
-          <span className="hint">Folder tempat thread-poster.js dkk berada, contoh: C:\autopost-threads</span>
-        </label>
+        <label className="field-label">Folder Proyek</label>
         <div className="folder-picker-row">
           <input type="text" readOnly value={config.project_folder} placeholder="Belum dipilih" />
           <button type="button" onClick={() => pickFolder("project_folder")}>Pilih Folder</button>
@@ -678,10 +720,6 @@ export default function App() {
         >
           {settingUp ? "Menyiapkan..." : "⚡ Setup Otomatis (folder + file + npm install)"}
         </button>
-        <p className="hint" style={{ marginTop: 6 }}>
-          Klik ini di RDP/PC baru — otomatis membuat folder proyek, menulis semua
-          file program, dan menjalankan "npm install". Cukup sekali per instalasi.
-        </p>
 
         {setupLog.length > 0 && (
           <div className="log-box">
@@ -698,10 +736,7 @@ export default function App() {
       <section>
         <h2>Jadwal (Windows Task Scheduler)</h2>
 
-        <label className="field-label">
-          Jam Posting Utama (thread-poster.js)
-          <span className="hint">Bebas tambah/hapus jam sesuai kebutuhan</span>
-        </label>
+        <label className="field-label">Jam Posting Utama (thread-poster.js)</label>
         {config.schedule.thread_poster_times.map((time, index) => (
           <div className="key-input-group" key={index} style={{ marginBottom: 6 }}>
             <input
@@ -720,10 +755,7 @@ export default function App() {
           + Tambah Jam Posting
         </button>
 
-        <label className="field-label" style={{ marginTop: 16 }}>
-          Interval Reply Checker (menit)
-          <span className="hint">Cek &amp; kirim reply link affiliate yang terjadwal</span>
-        </label>
+        <label className="field-label" style={{ marginTop: 16 }}>Interval Reply Checker (menit)</label>
         <input
           type="number"
           min={1}
@@ -736,12 +768,7 @@ export default function App() {
           }
         />
 
-        <label className="field-label">
-          Interval Comment Responder (menit)
-          <span className="hint">
-            Hanya berjalan kalau toggle "Balasan Komentar Otomatis (AI)" di atas AKTIF
-          </span>
-        </label>
+        <label className="field-label">Interval Comment Responder (menit)</label>
         <input
           type="number"
           min={1}
@@ -755,10 +782,7 @@ export default function App() {
           }
         />
 
-        <label className="field-label">
-          Refresh Token — Hari &amp; Jam
-          <span className="hint">Cukup 1x seminggu</span>
-        </label>
+        <label className="field-label">Refresh Token — Hari &amp; Jam</label>
         <ChoiceButtons
           options={HARI_OPTIONS}
           value={config.schedule.refresh_token_day}
