@@ -22,6 +22,10 @@
 //     sistem (token/akun bermasalah, jaringan putus, rate limit, server
 //     error) TIDAK dihitung, supaya antrean tidak habis masuk "failed"
 //     gara-gara masalah sementara.
+//  5. (BARU) Lock file: kalau run sebelumnya masih berjalan (misal utas
+//     panjang), run yang baru dilewati supaya tidak terjadi posting dobel.
+//  6. (BARU) Nama file di R2 dibersihkan dari simbol yang merusak URL.
+//  7. (BARU) Utas yang sedang setengah jalan diprioritaskan sebelum item lain.
 
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const fs = require('fs');
@@ -42,7 +46,9 @@ const LOG_FILE = path.join(__dirname, 'thread-poster.log');
 const PENDING_REPLY_FILE = path.join(__dirname, 'pending-reply.json');
 const POSTED_INDEX_FILE = path.join(__dirname, 'posted-index.json');
 const THREAD_STATE_FILE = path.join(__dirname, 'thread-state.json'); // progres utas
-const FAILED_ITEMS_FILE = path.join(__dirname, 'failed-items.json'); // BARU: penghitung gagal
+const FAILED_ITEMS_FILE = path.join(__dirname, 'failed-items.json'); // penghitung gagal
+const LOCK_FILE = path.join(__dirname, 'thread-poster.lock');
+const LOCK_STALE_MS = 2 * 60 * 60 * 1000; // lock dianggap basi setelah 2 jam
 // Folder untuk item bermasalah (dibuat otomatis kalau belum ada).
 // Bisa diubah lewat FAILED_FOLDER di .env, default: folder "failed" di samping skrip ini.
 const FAILED_DIR = process.env.FAILED_FOLDER && process.env.FAILED_FOLDER.trim() !== ''
@@ -151,7 +157,53 @@ function readTextSafe(filePath) {
 }
 
 // ====================================================
-// 0. STATE PROGRES UTAS (BARU)
+// LOCK: cegah dua proses thread-poster berjalan bersamaan (BARU)
+// ====================================================
+// Tiap jam posting adalah task terpisah di Task Scheduler. Kalau utas panjang
+// masih berjalan saat jam berikutnya tiba, tanpa lock dua proses akan memilih
+// item yang sama dan memposting dobel.
+let lockOwned = false;
+
+function acquireLock() {
+  try {
+    const fd = fs.openSync(LOCK_FILE, 'wx'); // gagal kalau file sudah ada
+    fs.writeSync(fd, String(Date.now()));
+    fs.closeSync(fd);
+    lockOwned = true;
+    return true;
+  } catch (err) {
+    if (err.code !== 'EEXIST') {
+      // Error lain (misal izin folder): jangan blokir posting, tapi catat.
+      log(`PERINGATAN: lock file tidak bisa dibuat (${err.message}), lanjut tanpa lock.`);
+      return true;
+    }
+    try {
+      const age = Date.now() - fs.statSync(LOCK_FILE).mtimeMs;
+      if (age > LOCK_STALE_MS) {
+        log('Lock lama ditemukan (proses sebelumnya kemungkinan mati), diambil alih.');
+        fs.writeFileSync(LOCK_FILE, String(Date.now()));
+        lockOwned = true;
+        return true;
+      }
+    } catch (e) {
+      // lock hilang / tidak terbaca, anggap masih dipakai proses lain
+    }
+    return false;
+  }
+}
+
+function releaseLock() {
+  if (!lockOwned) return;
+  try {
+    fs.unlinkSync(LOCK_FILE);
+  } catch (e) {
+    // abaikan
+  }
+  lockOwned = false;
+}
+
+// ====================================================
+// 0. STATE PROGRES UTAS
 // ====================================================
 // Bentuk: { "utas001": { lastPostId, doneParts: [1,2], captions: {"1":"..","2":".."} } }
 function loadThreadStates() {
@@ -275,7 +327,14 @@ function getNextItem() {
     // ATAU ada progres tersimpan (artinya tinggal menyelesaikan/merapikan).
     const hasPostablePart = Object.values(group.parts).some((p) => p.txtPath || p.mediaPath);
     if (!hasPostablePart && !states[id]) continue;
-    candidates.push({ type: 'thread', id, group, time: group.earliestTime });
+    // Utas yang sudah setengah jalan diprioritaskan (waktu "paling lama")
+    // supaya diselesaikan dulu sebelum item lain, tidak menggantung.
+    candidates.push({
+      type: 'thread',
+      id,
+      group,
+      time: states[id] ? new Date(0) : group.earliestTime,
+    });
   }
   for (const [id, group] of Object.entries(standaloneGroups)) {
     // butuh minimal txt ATAU media
@@ -297,8 +356,10 @@ async function uploadMedia(mediaPath, ext) {
   log(`Uploading media ke Cloudflare R2 (${isVideo ? 'video' : 'image'}): ${mediaPath}`);
 
   const fileBuffer = fs.readFileSync(mediaPath);
-  // Nama file unik biar tidak bentrok antar upload (timestamp + nama asli)
-  const objectKey = `threads-autopost/${Date.now()}-${path.basename(mediaPath)}`;
+  // Nama file dibersihkan dari simbol yang bisa merusak URL (spasi, #, ?, dll)
+  // dan diberi timestamp supaya unik antar upload.
+  const safeName = path.basename(mediaPath).replace(/[^a-zA-Z0-9._-]/g, '_');
+  const objectKey = `threads-autopost/${Date.now()}-${safeName}`;
   const contentType = isVideo ? 'video/mp4' : (ext === '.png' ? 'image/png' : 'image/jpeg');
 
   await r2Client.send(new PutObjectCommand({
@@ -308,7 +369,7 @@ async function uploadMedia(mediaPath, ext) {
     ContentType: contentType,
   }));
 
-  const publicUrl = `${R2_PUBLIC_URL_BASE}/${encodeURI(objectKey)}`;
+  const publicUrl = `${R2_PUBLIC_URL_BASE}/${objectKey}`;
   log(`Upload selesai. URL: ${publicUrl}`);
   return { url: publicUrl, isVideo, objectKey };
 }
@@ -379,8 +440,8 @@ async function publishContainer(containerId) {
 }
 
 // Post 1 bagian (dipakai baik standalone maupun tiap part utas)
-// PERBAIKAN 1: file di R2 dihapus lewat "finally", jadi tetap terhapus
-// walaupun createContainer / waitUntilFinished / publishContainer gagal.
+// File di R2 dihapus lewat "finally", jadi tetap terhapus walaupun
+// createContainer / waitUntilFinished / publishContainer gagal.
 // Kalau gagal, file asli masih ada di folder queue dan akan diupload ulang
 // saat dicoba lagi di jadwal berikutnya.
 async function postOnePart({ text, mediaPath, mediaExt, replyToId }) {
@@ -488,11 +549,10 @@ async function processStandalone(item) {
 // ====================================================
 // 8. PROSES: UTAS BERANTAI
 // ====================================================
-// PERBAIKAN 2: progres tiap part disimpan ke thread-state.json dan file
-// part yang sukses langsung dipindah ke "posted". Kalau utas gagal di
-// tengah, jadwal berikutnya MELANJUTKAN dari part yang belum terposting
-// (reply-nya tetap nyambung ke part terakhir yang sudah terbit),
-// bukan mengulang dari part 1.
+// Progres tiap part disimpan ke thread-state.json dan file part yang sukses
+// langsung dipindah ke "posted". Kalau utas gagal di tengah, jadwal berikutnya
+// MELANJUTKAN dari part yang belum terposting (reply-nya tetap nyambung ke
+// part terakhir yang sudah terbit), bukan mengulang dari part 1.
 async function processThread(item) {
   const { group, id } = item;
   const allPartNumbers = Object.keys(group.parts).map(Number).sort((a, b) => a - b);
@@ -535,44 +595,44 @@ async function processThread(item) {
 
   let postedThisRun = 0;
   try {
-  for (let i = 0; i < pendingParts.length; i++) {
-    const partNum = pendingParts[i];
-    const part = group.parts[partNum];
-    const text = readTextSafe(part.txtPath);
+    for (let i = 0; i < pendingParts.length; i++) {
+      const partNum = pendingParts[i];
+      const part = group.parts[partNum];
+      const text = readTextSafe(part.txtPath);
 
-    log(`Posting ${id} part ${partNum} (${state.doneParts.length + 1}/${totalParts})...`);
+      log(`Posting ${id} part ${partNum} (${state.doneParts.length + 1}/${totalParts})...`);
 
-    // Kalau ini gagal, error naik ke main; progres part sebelumnya sudah aman tersimpan.
-    const postId = await postOnePart({
-      text,
-      mediaPath: part.mediaPath,
-      mediaExt: part.mediaExt,
-      replyToId: previousPostId, // null untuk part pertama
-    });
+      // Kalau ini gagal, error naik ke main; progres part sebelumnya sudah aman tersimpan.
+      const postId = await postOnePart({
+        text,
+        mediaPath: part.mediaPath,
+        mediaExt: part.mediaExt,
+        replyToId: previousPostId, // null untuk part pertama
+      });
 
-    previousPostId = postId;
-    lastPostId = postId;
-    postedThisRun++;
+      previousPostId = postId;
+      lastPostId = postId;
+      postedThisRun++;
 
-    // Simpan progres DULU (paling penting), baru pindahkan file.
-    state.lastPostId = postId;
-    state.doneParts.push(partNum);
-    state.captions[String(partNum)] = text;
-    try {
-      setThreadState(id, state);
-    } catch (err) {
-      // Kalau progres gagal tersimpan, lanjutkan saja (utas tetap tersambung
-      // di run ini), tapi catat peringatan.
-      log(`PERINGATAN: gagal menyimpan progres utas ${id}: ${err.message}`);
+      // Simpan progres DULU (paling penting), baru pindahkan file.
+      state.lastPostId = postId;
+      state.doneParts.push(partNum);
+      state.captions[String(partNum)] = text;
+      try {
+        setThreadState(id, state);
+      } catch (err) {
+        // Kalau progres gagal tersimpan, lanjutkan saja (utas tetap tersambung
+        // di run ini), tapi catat peringatan.
+        log(`PERINGATAN: gagal menyimpan progres utas ${id}: ${err.message}`);
+      }
+      moveFilesToPosted([part.txtPath, part.mediaPath]);
+
+      // Jeda antar part, kecuali setelah part terakhir
+      if (i < pendingParts.length - 1) {
+        log(`Menunggu ${DELAY_BETWEEN_PARTS_MS / 1000} detik sebelum part berikutnya...`);
+        await sleep(DELAY_BETWEEN_PARTS_MS);
+      }
     }
-    moveFilesToPosted([part.txtPath, part.mediaPath]);
-
-    // Jeda antar part, kecuali setelah part terakhir
-    if (i < pendingParts.length - 1) {
-      log(`Menunggu ${DELAY_BETWEEN_PARTS_MS / 1000} detik sebelum part berikutnya...`);
-      await sleep(DELAY_BETWEEN_PARTS_MS);
-    }
-  }
   } catch (err) {
     // Tandai kalau run ini sempat menerbitkan part (berarti ada kemajuan,
     // bukan macet di tempat yang sama).
@@ -648,7 +708,7 @@ function afterPostBookkeeping({ postId, isJualan, captionText, replyText }) {
 }
 
 // ====================================================
-// 10. PENGHITUNG GAGAL & FOLDER "failed" (BARU)
+// 10. PENGHITUNG GAGAL & FOLDER "failed"
 // ====================================================
 const NETWORK_ERROR_CODES = [
   'ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'ENOTFOUND',
@@ -757,7 +817,7 @@ function checkEnv() {
   return true;
 }
 
-async function main() {
+async function run() {
   log('=== Menjalankan thread-poster ===');
 
   if (!checkEnv()) return;
@@ -824,6 +884,20 @@ async function main() {
       }
       if (count > 0) log(`Kegagalan ke-${count} dari ${MAX_FAILURES} untuk ${item.id}.`);
     }
+  }
+}
+
+// Pembungkus: pastikan hanya satu proses yang berjalan pada satu waktu,
+// dan lock selalu dilepas walaupun terjadi error.
+async function main() {
+  if (!acquireLock()) {
+    log('Proses thread-poster lain masih berjalan, run ini dilewati.');
+    return;
+  }
+  try {
+    await run();
+  } finally {
+    releaseLock();
   }
 }
 
