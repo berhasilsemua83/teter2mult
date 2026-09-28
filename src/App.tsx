@@ -15,10 +15,12 @@ interface Profile {
   name: string;
   threads_user_id: string;
   threads_access_token: string;
-  cloudinary: {
-    cloud_name: string;
-    api_key: string;
-    api_secret: string;
+  r2: {
+    account_id: string;
+    access_key_id: string;
+    secret_access_key: string;
+    bucket_name: string;
+    public_url_base: string;
   };
   gemini_api_keys: string[];
   ai_reply_enabled: boolean;
@@ -42,7 +44,7 @@ const EMPTY_CONFIG: Profile = {
   name: "",
   threads_user_id: "",
   threads_access_token: "",
-  cloudinary: { cloud_name: "", api_key: "", api_secret: "" },
+  r2: { account_id: "", access_key_id: "", secret_access_key: "", bucket_name: "", public_url_base: "" },
   gemini_api_keys: [""],
   ai_reply_enabled: false,
   queue_folder: "",
@@ -373,46 +375,63 @@ export default function App() {
         />
       </section>
 
-      {/* ===== CLOUDINARY ===== */}
+      {/* ===== CLOUDFLARE R2 ===== */}
       <section>
-        <h2>Cloudinary (hosting video/gambar)</h2>
+        <h2>Cloudflare R2 (hosting video/gambar)</h2>
+
         <label className="field-label">
-          Cloudinary Cloud Name
-          <span className="hint">Dari dashboard cloudinary.com</span>
+          Cloudflare Account ID
+          <span className="hint">Dari dashboard Cloudflare, menu R2</span>
         </label>
         <input
           type="text"
-          placeholder="Contoh: dxyz1234"
-          value={config.cloudinary.cloud_name}
-          onChange={(e) =>
-            setConfig({ ...config, cloudinary: { ...config.cloudinary, cloud_name: e.target.value } })
-          }
+          placeholder="Contoh: a1b2c3d4e5f6..."
+          value={config.r2.account_id}
+          onChange={(e) => setConfig({ ...config, r2: { ...config.r2, account_id: e.target.value } })}
         />
 
         <label className="field-label">
-          Cloudinary API Key
-          <span className="hint">Angka di dashboard Cloudinary, bukan API Secret</span>
+          R2 Access Key ID
+          <span className="hint">Dari "Manage R2 API Tokens" saat membuat token</span>
         </label>
         <input
           type="text"
-          placeholder="Contoh: 123456789012345"
-          value={config.cloudinary.api_key}
-          onChange={(e) =>
-            setConfig({ ...config, cloudinary: { ...config.cloudinary, api_key: e.target.value } })
-          }
+          placeholder="R2 Access Key ID"
+          value={config.r2.access_key_id}
+          onChange={(e) => setConfig({ ...config, r2: { ...config.r2, access_key_id: e.target.value } })}
         />
 
         <label className="field-label">
-          Cloudinary API Secret
-          <span className="hint">Jaga kerahasiaannya, jangan dibagikan</span>
+          R2 Secret Access Key
+          <span className="hint">Jaga kerahasiaannya, hanya muncul sekali saat dibuat</span>
         </label>
         <input
           type="password"
-          placeholder="API Secret Cloudinary"
-          value={config.cloudinary.api_secret}
-          onChange={(e) =>
-            setConfig({ ...config, cloudinary: { ...config.cloudinary, api_secret: e.target.value } })
-          }
+          placeholder="R2 Secret Access Key"
+          value={config.r2.secret_access_key}
+          onChange={(e) => setConfig({ ...config, r2: { ...config.r2, secret_access_key: e.target.value } })}
+        />
+
+        <label className="field-label">
+          Nama Bucket
+          <span className="hint">Nama bucket R2 yang kamu buat, contoh: threads-media</span>
+        </label>
+        <input
+          type="text"
+          placeholder="threads-media"
+          value={config.r2.bucket_name}
+          onChange={(e) => setConfig({ ...config, r2: { ...config.r2, bucket_name: e.target.value } })}
+        />
+
+        <label className="field-label">
+          Public URL Base
+          <span className="hint">URL publik dari bucket, contoh: https://pub-xxxxx.r2.dev (tanpa garis miring di akhir)</span>
+        </label>
+        <input
+          type="text"
+          placeholder="https://pub-xxxxxxxx.r2.dev"
+          value={config.r2.public_url_base}
+          onChange={(e) => setConfig({ ...config, r2: { ...config.r2, public_url_base: e.target.value } })}
         />
       </section>
 
