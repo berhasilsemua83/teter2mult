@@ -42,10 +42,12 @@ const SCRIPT_PACKAGE_JSON: &str = include_str!("../scripts/package.json");
 // ====== STRUKTUR DATA ======
 
 #[derive(Serialize, Deserialize, Clone, Default)]
-struct CloudinaryConfig {
-    cloud_name: String,
-    api_key: String,
-    api_secret: String,
+struct R2Config {
+    account_id: String,
+    access_key_id: String,
+    secret_access_key: String,
+    bucket_name: String,
+    public_url_base: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -64,7 +66,7 @@ struct Profile {
     name: String,
     threads_user_id: String,
     threads_access_token: String,
-    cloudinary: CloudinaryConfig,
+    r2: R2Config,
     gemini_api_keys: Vec<String>,
     ai_reply_enabled: bool,
     queue_folder: String,
@@ -264,12 +266,14 @@ fn sync_env_file(profile: &Profile) -> Result<(), String> {
     let gemini_keys_joined = profile.gemini_api_keys.join(",");
 
     let content = format!(
-        "THREADS_USER_ID={}\nTHREADS_ACCESS_TOKEN={}\nCLOUDINARY_CLOUD_NAME={}\nCLOUDINARY_API_KEY={}\nCLOUDINARY_API_SECRET={}\nGEMINI_API_KEYS={}\nQUEUE_FOLDER={}\nPOSTED_FOLDER={}\n",
+        "THREADS_USER_ID={}\nTHREADS_ACCESS_TOKEN={}\nR2_ACCOUNT_ID={}\nR2_ACCESS_KEY_ID={}\nR2_SECRET_ACCESS_KEY={}\nR2_BUCKET_NAME={}\nR2_PUBLIC_URL_BASE={}\nGEMINI_API_KEYS={}\nQUEUE_FOLDER={}\nPOSTED_FOLDER={}\n",
         profile.threads_user_id,
         profile.threads_access_token,
-        profile.cloudinary.cloud_name,
-        profile.cloudinary.api_key,
-        profile.cloudinary.api_secret,
+        profile.r2.account_id,
+        profile.r2.access_key_id,
+        profile.r2.secret_access_key,
+        profile.r2.bucket_name,
+        profile.r2.public_url_base,
         gemini_keys_joined,
         profile.queue_folder,
         profile.posted_folder,
