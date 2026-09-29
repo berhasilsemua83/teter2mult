@@ -573,9 +573,11 @@ fn get_dashboard_data(app: tauri::AppHandle, profile_id: String) -> Result<Dashb
                         
                         groups.insert(base_clean.clone());
 
-                        let created = meta.created().unwrap_or(meta.modified().unwrap_or(std::time::SystemTime::now()));
-                        if first || created < oldest_time {
-                            oldest_time = created;
+// Pakai Date modified agar sama persis dengan Windows Explorer
+let file_time = meta.modified().unwrap_or_else(|_| meta.created().unwrap_or(std::time::SystemTime::now()));
+
+if first || file_time < oldest_time {
+    oldest_time = file_time;
                             oldest_name = base_clean;
                             first = false;
                         }
