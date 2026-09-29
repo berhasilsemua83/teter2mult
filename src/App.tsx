@@ -22,8 +22,10 @@ DAFTAR ISI:
 BAGIAN 1: PERSIAPAN KREDENSIAL (API & TOKEN)
 ---------------------------------------------------------
 Di menu aplikasi, Anda wajib mengisi data penghubung:
+
 A. THREADS API
-   1. Threads User ID: ID angka unik akun Anda (dari Meta for Developers).
+   1. Threads User ID: Ini adalah ID ANGKA UNIK dari profil akun Threads Anda (contoh: 17841400...). 
+      ⚠️ PENTING: Ini BEDA dengan "App ID" (ID Aplikasi yang anda buat di Meta). Jangan sampai tertukar! Dapatkan User ID ini dari Graph API Explorer Meta.
    2. Threads Access Token: Long-Lived Token dari Meta (Di-refresh otomatis tiap minggu).
 
 B. CLOUDFLARE R2 (Untuk Hosting Gambar/Video Sementara)
@@ -48,7 +50,7 @@ WAJIB: Klik tombol "⚡ Setup Otomatis" setelah Folder Proyek dipilih.
 ---------------------------------------------------------
 BAGIAN 3: ATURAN PENAMAAN FILE (SANGAT PENTING)
 ---------------------------------------------------------
-Bot membaca urutan berdasarkan waktu file dimasukkan (Paling lama antre = Tayang duluan).
+Bot membaca urutan antrean berdasarkan waktu file dimasukkan.
 
 1. POSTINGAN BIASA (1 Teks, 1 Gambar/Video) -> Syarat: Nama file sama.
    - promosi.txt
@@ -64,7 +66,16 @@ Bot membaca urutan berdasarkan waktu file dimasukkan (Paling lama antre = Tayang
    - cerita_part1.jpg
    - cerita_part2.txt
 
-4. BALASAN LINK AFFILIATE (JUALAN) -> Gunakan akhiran "_reply.txt".
+4. KOMBINASI UTAS & SLIDE (CAROUSEL BERANTAI)
+   Anda bisa menggabungkan keduanya! 
+   ⚠️ ATURAN: Tulis "_part" dulu, baru "_slide" di belakangnya.
+   - event_part1.txt (Teks untuk post utama)
+   - event_part1_slide1.jpg (Gambar slide 1 di post utama)
+   - event_part1_slide2.jpg (Gambar slide 2 di post utama)
+   - event_part2.txt (Balasan teks di bawahnya)
+   - event_part2.jpg (Foto tunggal nempel di part 2)
+
+5. BALASAN LINK AFFILIATE (JUALAN) -> Gunakan akhiran "_reply.txt".
    Bot mengirim link affiliate ke kolom komentar Anda sendiri dengan jeda acak (15-50 menit).
    - tas_kerja.txt
    - tas_kerja_slide1.jpg
