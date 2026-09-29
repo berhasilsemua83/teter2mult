@@ -747,15 +747,21 @@ async function handleDisableSchedule() {
         )}
       </section>
 
-      {/* ===== JADWAL ===== */}
+{/* ===== JADWAL ===== */}
       <section>
         <h2>Jadwal (Windows Task Scheduler)</h2>
 
-        <label className="field-label">Jam Posting Utama (thread-poster.js)</label>
+        <label className="field-label">
+          Jam Posting Utama (thread-poster.js)
+          <span className="hint">Gunakan format 24 jam, contoh: 07:00 atau 14:30</span>
+        </label>
         {config.schedule.thread_poster_times.map((time, index) => (
           <div className="key-input-group" key={index} style={{ marginBottom: 6 }}>
+            {/* INPUT TIME DIUBAH JADI TEXT AGAR BISA 24 JAM */}
             <input
-              type="time"
+              type="text"
+              placeholder="14:30"
+              maxLength={5}
               value={time}
               onChange={(e) => updateThreadPosterTime(index, e.target.value)}
             />
@@ -806,8 +812,11 @@ async function handleDisableSchedule() {
           }
         />
         <div className="key-input-group" style={{ marginTop: 8 }}>
+           {/* INPUT TIME DIUBAH JADI TEXT */}
           <input
-            type="time"
+            type="text"
+            placeholder="03:00"
+            maxLength={5}
             value={config.schedule.refresh_token_time}
             onChange={(e) =>
               setConfig({ ...config, schedule: { ...config.schedule, refresh_token_time: e.target.value } })
@@ -815,9 +824,16 @@ async function handleDisableSchedule() {
           />
         </div>
 
-        <button type="button" className="btn-save" style={{ marginTop: 16 }} onClick={handleApplySchedule} disabled={applying}>
-          {applying ? "Menerapkan..." : "Simpan & Terapkan Jadwal ke Task Scheduler"}
-        </button>
+        {/* TOMBOL ON DAN OFF */}
+        <div style={{ display: "flex", gap: "10px", marginTop: "16px" }}>
+          <button type="button" className="btn-save" style={{ flex: 2 }} onClick={handleApplySchedule} disabled={applying}>
+            {applying ? "Proses..." : "▶ Aktifkan Bot (Simpan & Terapkan)"}
+          </button>
+          
+          <button type="button" className="btn-save" style={{ flex: 1, background: "#ef4444", boxShadow: "none" }} onClick={handleDisableSchedule} disabled={applying}>
+            ⏹ Matikan Bot (OFF)
+          </button>
+        </div>
 
         {scheduleLog.length > 0 && (
           <div className="log-box">
