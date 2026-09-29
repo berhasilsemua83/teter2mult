@@ -611,6 +611,7 @@ fn main() {
             apply_schedule,
             setup_project,
             detect_node_path,
+            disable_schedule, 
             get_dashboard_data // Daftarkan command baru
         ])
         .run(tauri::generate_context!())
