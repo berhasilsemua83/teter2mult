@@ -191,8 +191,15 @@ function scanQueue() {
       baseName = baseName.replace(/_part\d+$/i, '');
     }
 
+// Gunakan mtimeMs (Date modified) agar sama dengan Windows Explorer
+    const fileTime = fs.statSync(fullPath).mtimeMs;
+
+    // Buat struktur objek jika belum ada
     if (!groups[baseName]) {
-      groups[baseName] = { earliestTime: fs.statSync(fullPath).birthtime, parts: {} };
+      groups[baseName] = { earliestTime: fileTime, parts: {} };
+    } else if (fileTime < groups[baseName].earliestTime) {
+      // Jika ada file pasangannya (misal .txt) yang lebih tua, update waktunya
+      groups[baseName].earliestTime = fileTime;
     }
     if (!groups[baseName].parts[partNum]) {
       groups[baseName].parts[partNum] = { slides: [] };
