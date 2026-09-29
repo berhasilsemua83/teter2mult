@@ -592,6 +592,12 @@ fn get_dashboard_data(app: tauri::AppHandle, profile_id: String) -> Result<Dashb
     Ok(state)
 }
 
+// ==== FITUR MATIKAN BOT (OFF) ====
+#[tauri::command]
+fn disable_schedule(profile_name: String) -> Result<String, String> {
+    cleanup_tasks_for_profile(&profile_name);
+    Ok("Bot berhasil DIMATIKAN. Semua jadwal telah dicabut dari Task Scheduler.".into())
+}
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
