@@ -529,6 +529,11 @@ export default function App() {
           <input type="text" value={config.node_exe_path} onChange={(e) => setConfig({ ...config, node_exe_path: e.target.value })} />
           <button type="button" onClick={handleDetectNode}>Deteksi</button>
         </div>
+                    {/* === TAMBAHKAN KODE INI DI SINI === */}
+        <span className="hint" style={{ marginTop: "6px", marginBottom: "14px", color: "#fca5a5" }}>
+          *Wajib install Node.js (versi LTS) dari nodejs.org terlebih dahulu sebelum klik Deteksi atau Memakai Aplikasi ini.
+        </span>
+        {/* ================================= */}
         <label className="field-label">Folder Proyek</label>
         <div className="folder-picker-row"><input type="text" readOnly value={config.project_folder} /><button type="button" onClick={() => pickFolder("project_folder")}>Pilih</button></div>
         
