@@ -7,30 +7,18 @@
 // 3. Utas Berantai (Part 1, Part 2, dst saling mereply)
 // 4. Otomatis menghapus file dari Cloudflare R2 setelah berhasil tayang.
 //
-// PERBAIKAN DI VERSI INI (dari hasil review):
-//  1. isSystemError sekarang juga mengenali error dari @aws-sdk/client-s3
-//     (Cloudflare R2) — sebelumnya cuma mengenali error axios/Threads.
-//     Tanpa ini, kredensial R2 salah / bucket belum publik akan dihitung
-//     sebagai kegagalan FILE (bisa masuk folder "failed" padahal filenya
-//     baik-baik saja, masalahnya di pengaturan R2).
-//  2. moveFilesToDir tidak pernah melempar error lagi (dibungkus try/catch
-//     di dalam). Sebelumnya, kalau proses pindah file gagal SETELAH post
-//     berhasil tayang, error itu naik dan dihitung sebagai kegagalan item —
-//     padahal postingannya sudah sukses.
-//  3. File "_reply" sekarang diambil dari part dengan nomor PALING BESAR
-//     yang punya file reply (sebelumnya berhenti di part pertama yang
-//     ketemu, karena ada "break").
-//  4. waitUntilFinished dan publishContainer sekarang diberi timeout,
-//     menyamakan dengan createContainer (sebelumnya tidak dibatasi,
-//     berisiko menggantung tanpa batas kalau koneksi macet).
-//  5. readJsonSafe sekarang mencadangkan file yang rusak ke ".bak" sebelum
-//     dipakai fallback kosong, supaya data lama tidak hilang percuma kalau
-//     file JSON rusak (misal proses mati saat menulis).
-//  6. (Tambahan, bukan dari 5 poin di atas) checkEnv() dikembalikan: cek
-//     variabel .env penting sebelum jalan, biar errornya jelas dari awal
-//     kalau kredensial belum lengkap, bukan error samar di tengah proses.
-//  7. (Kecil) R2_PUBLIC_URL_BASE dibersihkan dari garis miring di akhir,
-//     supaya URL hasil upload tidak dobel garis miring.
+// PERBAIKAN DI VERSI INI:
+//  1. [BUGFIX] isSystemError kini memprioritaskan pengecekan 'error.code' dari 
+//     Meta API. Jika Meta mengirim error validasi file (misal: code 100 karena caption 
+//     kepanjangan) yang dibungkus dengan HTTP 5xx, sistem tidak akan tertipu lagi.
+//     Sistem akan akurat menghitungnya sebagai kegagalan FILE dan membuangnya ke 
+//     folder 'failed' setelah 3x gagal, mencegah infinite loop.
+//  2. moveFilesToDir dibungkus try/catch internal agar tidak menggagalkan status post.
+//  3. File "_reply" diambil dari part dengan nomor PALING BESAR.
+//  4. waitUntilFinished dan publishContainer diberi timeout (HTTP_TIMEOUT_MS).
+//  5. readJsonSafe mencadangkan file rusak ke ".bak" sebelum direset.
+//  6. checkEnv() memastikan variabel .env lengkap sebelum bot jalan.
+//  7. R2_PUBLIC_URL_BASE dibersihkan dari garis miring ganda.
 
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const fs = require('fs');
@@ -62,7 +50,7 @@ const THREADS_USER_ID = process.env.THREADS_USER_ID;
 const THREADS_ACCESS_TOKEN = process.env.THREADS_ACCESS_TOKEN;
 const THREADS_API_BASE = 'https://graph.threads.net/v1.0';
 
-// PERBAIKAN 7: buang garis miring di akhir supaya URL tidak dobel "//"
+// Membersihkan URL agar tidak dobel "//"
 const R2_PUBLIC_URL_BASE = (process.env.R2_PUBLIC_URL_BASE || '').replace(/\/$/, '');
 
 // Inisialisasi Cloudflare R2
@@ -95,9 +83,7 @@ function errMsg(err) {
   return err && err.message ? err.message : String(err);
 }
 
-// PERBAIKAN 5: kalau file JSON rusak/tidak bisa diparse, cadangkan dulu ke
-// ".bak" sebelum dianggap kosong. Supaya data lama tidak hilang percuma
-// kalau nanti mau dicek manual apa yang rusak.
+// Perlindungan jika JSON korup (backup ke .bak)
 function readJsonSafe(file, fallback) {
   if (!fs.existsSync(file)) return fallback;
   try {
@@ -124,7 +110,7 @@ function readTextSafe(filePath) {
 }
 
 // ====================================================
-// CEK KELENGKAPAN .env (Tambahan)
+// CEK KELENGKAPAN .env
 // ====================================================
 function checkEnv() {
   const required = [
@@ -151,10 +137,10 @@ function acquireLock() {
     lockOwned = true;
     return true;
   } catch (err) {
-    if (err.code !== 'EEXIST') return true; // Error izin, abaikan
+    if (err.code !== 'EEXIST') return true; 
     try {
       const age = Date.now() - fs.statSync(LOCK_FILE).mtimeMs;
-      if (age > 2 * 60 * 60 * 1000) { // Jika file lock sudah basi (2 jam)
+      if (age > 2 * 60 * 60 * 1000) { 
         fs.writeFileSync(LOCK_FILE, String(Date.now()));
         lockOwned = true;
         return true;
@@ -173,8 +159,6 @@ function releaseLock() {
 // ====================================================
 // 1. SCAN FOLDER QUEUE & KELOMPOKKAN FILE
 // ====================================================
-// Fitur ini otomatis mendeteksi apakah file tersebut Standalone, Utas, atau Carousel.
-// Aturan: nama[_partN][_slideN][_reply].ext
 function scanQueue() {
   if (!fs.existsSync(QUEUE_DIR)) throw new Error(`Folder queue tidak ditemukan: ${QUEUE_DIR}`);
 
@@ -185,16 +169,14 @@ function scanQueue() {
     if (!fs.statSync(fullPath).isFile()) continue;
 
     const ext = path.extname(fileName).toLowerCase();
-    let baseName = path.basename(fileName, ext); // Buang ekstensi (misal: .jpg)
+    let baseName = path.basename(fileName, ext);
 
-    // Cek apakah ini file balasan affiliate
     let isReply = false;
     if (baseName.toLowerCase().endsWith('_reply')) {
       isReply = true;
       baseName = baseName.replace(/_reply$/i, '');
     }
 
-    // Cek Nomor Slide (Carousel)
     let slideNum = 1;
     const slideMatch = baseName.match(/_slide(\d+)$/i);
     if (slideMatch) {
@@ -202,7 +184,6 @@ function scanQueue() {
       baseName = baseName.replace(/_slide\d+$/i, '');
     }
 
-    // Cek Nomor Part (Utas Berantai)
     let partNum = 1;
     const partMatch = baseName.match(/_part(\d+)$/i);
     if (partMatch) {
@@ -210,7 +191,6 @@ function scanQueue() {
       baseName = baseName.replace(/_part\d+$/i, '');
     }
 
-    // Buat struktur objek jika belum ada
     if (!groups[baseName]) {
       groups[baseName] = { earliestTime: fs.statSync(fullPath).birthtime, parts: {} };
     }
@@ -220,7 +200,6 @@ function scanQueue() {
 
     const partObj = groups[baseName].parts[partNum];
 
-    // Masukkan file ke tempat yang tepat
     if (isReply) {
       partObj.replyPath = fullPath;
     } else if (ext === '.txt') {
@@ -230,7 +209,6 @@ function scanQueue() {
     }
   }
 
-  // Rapikan urutan slide dari terkecil ke terbesar
   for (const g of Object.values(groups)) {
     for (const p of Object.values(g.parts)) {
       p.slides.sort((a, b) => a.num - b.num);
@@ -248,14 +226,12 @@ function getNextItem() {
   for (const [id, group] of Object.entries(groups)) {
     const hasPostablePart = Object.values(group.parts).some(p => p.txtPath || p.slides.length > 0);
     if (!hasPostablePart && !states[id]) continue;
-
-    // Prioritaskan Utas yang sudah setengah jalan
     candidates.push({ id, group, time: states[id] ? 0 : group.earliestTime });
   }
 
   if (candidates.length === 0) return null;
   candidates.sort((a, b) => a.time - b.time);
-  return candidates[0]; // Ambil antrean paling tua
+  return candidates[0]; 
 }
 
 // ====================================================
@@ -309,7 +285,6 @@ async function createContainer({ text, media_type, mediaUrl, isCarouselItem, chi
   return res.data.id;
 }
 
-// PERBAIKAN 4: tambah timeout, sebelumnya request ini tidak dibatasi waktu.
 async function waitUntilFinished(containerId) {
   for (let i = 0; i < 30; i++) {
     const res = await axios.get(`${THREADS_API_BASE}/${containerId}`, {
@@ -323,12 +298,11 @@ async function waitUntilFinished(containerId) {
     }
 
     log(`Menunggu media siap (Status: ${res.data.status})...`);
-    await sleep(10000); // Tunggu 10 detik sebelum cek lagi
+    await sleep(10000); 
   }
   throw new Error('Timeout menunggu media selesai diproses');
 }
 
-// PERBAIKAN 4: tambah timeout, sebelumnya request ini tidak dibatasi waktu.
 async function publishContainer(containerId) {
   const res = await axios.post(`${THREADS_API_BASE}/${THREADS_USER_ID}/threads_publish`, null, {
     params: { creation_id: containerId, access_token: THREADS_ACCESS_TOKEN },
@@ -341,17 +315,15 @@ async function publishContainer(containerId) {
 // 4. LOGIKA POSTING (TEKS, SINGLE, CAROUSEL)
 // ====================================================
 async function postOnePart({ text, slides, replyToId }) {
-  let uploadedKeys = []; // Simpan data R2 untuk dihapus nanti
+  let uploadedKeys = []; 
 
   try {
-    // KONDISI 1: Hanya Teks
     if (slides.length === 0) {
       log(`Membuat container (TEKS SAJA)...`);
       const cid = await createContainer({ text, media_type: 'TEXT', replyToId });
       return await publishContainer(cid);
     }
 
-    // KONDISI 2: Single Media (1 Gambar/Video)
     if (slides.length === 1) {
       log(`Membuat container (SINGLE MEDIA)...`);
       const s = slides[0];
@@ -365,13 +337,11 @@ async function postOnePart({ text, slides, replyToId }) {
       return await publishContainer(cid);
     }
 
-    // KONDISI 3: Carousel (Banyak Gambar/Video Slide)
     if (slides.length > 10) throw new Error("Instagram/Threads membatasi maksimal 10 slide per post.");
 
     log(`Membuat container (CAROUSEL - ${slides.length} SLIDE)...`);
     let childrenIds = [];
 
-    // Upload dan buat container anak untuk tiap slide
     for (const s of slides) {
       const uploaded = await uploadMedia(s.path, s.ext);
       uploadedKeys.push(uploaded.objectKey);
@@ -383,12 +353,10 @@ async function postOnePart({ text, slides, replyToId }) {
       childrenIds.push(childId);
     }
 
-    // Buat container induk (Carousel) yang mengikat anak-anaknya
     const cid = await createContainer({ text, media_type: 'CAROUSEL', children: childrenIds.join(','), replyToId });
     return await publishContainer(cid);
 
   } finally {
-    // BERHASIL ATAU GAGAL, file di R2 WAJIB dihapus agar kuota tidak penuh
     for (const key of uploadedKeys) {
       await deleteFromR2(key);
     }
@@ -398,10 +366,6 @@ async function postOnePart({ text, slides, replyToId }) {
 // ====================================================
 // 5. PROSES UTAMA (MENANGANI ITEM)
 // ====================================================
-// PERBAIKAN 2: dibungkus try/catch internal, TIDAK PERNAH melempar error.
-// Kalau gagal memindah file setelah post sudah tayang, itu cuma dicatat
-// sebagai peringatan di log — tidak boleh membuat item dianggap gagal
-// (nanti malah terposting ulang padahal sudah sukses tayang).
 function moveFilesToDir(destDir, filePaths) {
   try {
     if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
@@ -416,7 +380,6 @@ function moveFilesToDir(destDir, filePaths) {
     try {
       fs.renameSync(p, dest);
     } catch (err) {
-      // Fallback jika beda partisi drive
       try {
         fs.copyFileSync(p, dest);
         fs.unlinkSync(p);
@@ -429,29 +392,21 @@ function moveFilesToDir(destDir, filePaths) {
 
 async function processItem(item) {
   const { id, group } = item;
-
-  // Baca progres jika ini adalah kelanjutan Utas
   const state = readJsonSafe(THREAD_STATE_FILE, {})[id] || { lastPostId: null, doneParts: [], captions: {} };
   const partNumbers = Object.keys(group.parts).map(Number).sort((a, b) => a - b);
 
-  // PERBAIKAN 3: cari file reply dari part dengan nomor PALING BESAR yang
-  // punya file reply (sebelumnya "break" di part pertama yang ketemu,
-  // jadi kalau ada beberapa file _reply, yang dipakai malah yang paling awal).
   let replyPath = null;
   for (const n of partNumbers) {
     if (group.parts[n].replyPath) replyPath = group.parts[n].replyPath;
   }
-  // Dibaca sekarang, sebelum file dipindah oleh proses posting di bawah.
   const replyText = readTextSafe(replyPath);
 
   let previousPostId = state.lastPostId;
   let lastPostId = state.lastPostId;
 
-  // Proses setiap Part
   for (const n of partNumbers) {
     const part = group.parts[n];
 
-    // Rapikan file part yang sudah sukses sebelumnya
     if (state.doneParts.includes(n)) {
       moveFilesToDir(POSTED_DIR, [part.txtPath, ...part.slides.map(s => s.path)]);
       continue;
@@ -462,13 +417,11 @@ async function processItem(item) {
     const text = readTextSafe(part.txtPath);
     log(`Memposting [${id}] part ${n}...`);
 
-    // Posting Part ini
     const postId = await postOnePart({ text, slides: part.slides, replyToId: previousPostId });
 
     previousPostId = postId;
     lastPostId = postId;
 
-    // Simpan Progres Utas
     state.lastPostId = postId;
     state.doneParts.push(n);
     state.captions[String(n)] = text;
@@ -477,10 +430,8 @@ async function processItem(item) {
     allStates[id] = state;
     writeJsonAtomic(THREAD_STATE_FILE, allStates);
 
-    // Pindah file ke folder Posted (tidak akan melempar error, lihat PERBAIKAN 2)
     moveFilesToDir(POSTED_DIR, [part.txtPath, ...part.slides.map(s => s.path)]);
 
-    // Jeda antar part (kecuali part terakhir)
     if (n !== partNumbers[partNumbers.length - 1]) {
       log(`Menunggu ${DELAY_BETWEEN_PARTS_MS / 1000} detik sebelum part selanjutnya...`);
       await sleep(DELAY_BETWEEN_PARTS_MS);
@@ -489,7 +440,6 @@ async function processItem(item) {
 
   if (!lastPostId) throw new Error(`Tidak ada konten valid untuk diposting dari ${id}`);
 
-  // Semua sukses! Bersihkan file Reply dan State Utas
   moveFilesToDir(POSTED_DIR, partNumbers.map(n => group.parts[n].replyPath).filter(Boolean));
 
   const allStatesFinal = readJsonSafe(THREAD_STATE_FILE, {});
@@ -503,24 +453,13 @@ async function processItem(item) {
 }
 
 // ====================================================
-// 6. MAIN & ERROR HANDLING
+// 6. MAIN & ERROR HANDLING (REVISI BUGFIX HTTP 5xx)
 // ====================================================
-// PERBAIKAN 1: sebelumnya cuma mengenali bentuk error axios/Threads
-// (err.response.status, err.code, err.name generik). Sekarang juga
-// mengenali bentuk error dari @aws-sdk/client-s3 (Cloudflare R2):
-//   - err.$metadata.httpStatusCode  -> status HTTP asli dari AWS SDK v3
-//   - err.name                     -> nama exception, misal "AccessDenied",
-//                                      "InvalidAccessKeyId",
-//                                      "SignatureDoesNotMatch",
-//                                      "CredentialsProviderError",
-//                                      "NoSuchBucket"
-// Tanpa ini, kredensial/bucket R2 yang salah akan dihitung sebagai
-// kegagalan FILE, bukan kegagalan sistem.
 const NETWORK_ERROR_CODES = [
   'ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'ENOTFOUND',
   'EAI_AGAIN', 'ECONNREFUSED', 'EPIPE', 'ENETUNREACH',
 ];
-const SYSTEM_API_CODES = [190, 102, 4, 17, 32, 613]; // token/sesi bermasalah & rate limit Graph API
+const SYSTEM_API_CODES = [190, 102, 4, 17, 32, 613]; 
 const SYSTEM_AWS_NAMES = [
   'CredentialsProviderError', 'InvalidAccessKeyId', 'SignatureDoesNotMatch',
   'AccessDenied', 'NoSuchBucket', 'TimeoutError',
@@ -529,17 +468,23 @@ const SYSTEM_AWS_NAMES = [
 function isSystemError(err) {
   if (!err) return false;
 
-  const status = err.response && err.response.status;
-  if (status === 401 || status === 403 || status === 429 || status >= 500) return true;
+  // 1. PRIORITAS UTAMA: Cek spesifik Error Code dari Meta API
+  const metaError = err.response?.data?.error;
+  if (metaError && metaError.code) {
+    // Jika ada kode dari Meta, HANYA anggap error sistem jika kodenya ada di daftar SYSTEM_API_CODES.
+    // (Contoh: kode 100 tidak ada di daftar ini, maka akan return FALSE / dihitung sebagai salah file).
+    return SYSTEM_API_CODES.includes(metaError.code);
+  }
 
-  const apiCode = err.response && err.response.data && err.response.data.error
-    && err.response.data.error.code;
-  if (SYSTEM_API_CODES.includes(apiCode)) return true;
-
+  // 2. Cek error koneksi / Node.js
   if (!err.response && err.code && NETWORK_ERROR_CODES.includes(err.code)) return true;
 
-  // Bentuk error khas AWS SDK v3 (dipakai @aws-sdk/client-s3 untuk R2)
-  const awsStatus = err.$metadata && err.$metadata.httpStatusCode;
+  // 3. Cek HTTP Status biasa (hanya jika bukan format API Meta)
+  const status = err.response?.status;
+  if (status === 401 || status === 403 || status === 429 || status >= 500) return true;
+
+  // 4. Cek Error spesifik dari AWS R2 SDK
+  const awsStatus = err.$metadata?.httpStatusCode;
   if (awsStatus === 401 || awsStatus === 403 || awsStatus >= 500) return true;
   if (err.name && SYSTEM_AWS_NAMES.includes(err.name)) return true;
 
@@ -573,7 +518,6 @@ async function main() {
     try {
       const result = await processItem(item);
 
-      // 1. Catat ke Dashboard UI (posted-index.json)
       let index = readJsonSafe(POSTED_INDEX_FILE, []);
       if (!Array.isArray(index)) index = [];
       index.push({
@@ -584,7 +528,6 @@ async function main() {
       });
       writeJsonAtomic(POSTED_INDEX_FILE, index);
 
-      // 2. Jadwalkan Reply Link Affiliate
       if (result.isJualan && result.replyText) {
         let pending = readJsonSafe(PENDING_REPLY_FILE, []);
         if (!Array.isArray(pending)) pending = [];
@@ -599,26 +542,24 @@ async function main() {
         log(`Reply affiliate dijadwalkan ${delayMins} menit dari sekarang.`);
       }
 
-      // 3. Bersihkan hitungan gagal (kalau ada)
       const fails = readJsonSafe(FAILED_ITEMS_FILE, {});
       if (fails[item.id]) { delete fails[item.id]; writeJsonAtomic(FAILED_ITEMS_FILE, fails); }
 
     } catch (err) {
       log(`[GAGAL] memproses ${item.id}: ${errMsg(err)}`);
 
-      // Jika masalah jaringan/kuota/kredensial R2, jangan salahkan file-nya
+      // Evaluasi error menggunakan isSystemError yang baru diperbaiki
       if (isSystemError(err)) {
         log('Kendala server/jaringan/kredensial (bukan salah file). File aman, akan dicoba lagi di jadwal berikutnya.');
         return;
       }
 
-      // Jika salah file-nya (format rusak dll), hitung kegagalan
+      // Hitung kegagalan karena ini salah file (misal teks > 500 huruf)
       const fails = readJsonSafe(FAILED_ITEMS_FILE, {});
       fails[item.id] = { count: (fails[item.id]?.count || 0) + 1, err: errMsg(err).slice(0, 500) };
       writeJsonAtomic(FAILED_ITEMS_FILE, fails);
 
       if (fails[item.id].count >= MAX_FAILURES) {
-        // Pindah ke folder failed
         let allFiles = [];
         for (const p of Object.values(item.group.parts)) {
           allFiles.push(p.txtPath, p.replyPath, ...p.slides.map(s => s.path));
