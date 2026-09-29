@@ -1,31 +1,36 @@
 // thread-poster.js
-// Menggantikan autopost.js versi sebelumnya.
-// Mendukung 2 jenis item di folder queue:
-//   1. Standalone  : produk001.mp4 / .jpg / .txt (kombinasi bebas)
-//   2. Utas berantai: utas001_part1.txt, utas001_part2.mp4, dst
-//      (tiap part di-reply ke part sebelumnya, membentuk 1 utas)
+// Mendukung Utas Berantai & Carousel (Slide)
 //
-// Tiap item (standalone ATAU 1 utas penuh) juga boleh punya file
-// "_reply.txt" untuk balasan berisi link affiliate, dikirim belakangan
-// lewat reply-checker.js (lihat pending-reply.json).
+// FITUR:
+// 1. Standalone (1 Teks / 1 Gambar / 1 Video)
+// 2. Carousel / Slide Kiri-Kanan (Kombinasi Gambar & Video, Maks 10)
+// 3. Utas Berantai (Part 1, Part 2, dst saling mereply)
+// 4. Otomatis menghapus file dari Cloudflare R2 setelah berhasil tayang.
 //
-// PERBAIKAN DI VERSI INI:
-//  1. File di R2 SELALU dihapus (try/finally), baik publish sukses maupun gagal.
-//     Kalau gagal, file asli tetap aman di folder queue dan akan diupload ulang.
-//  2. Utas yang gagal di tengah TIDAK diposting dobel. Tiap part yang sukses
-//     langsung dipindah ke "posted" dan dicatat di thread-state.json, sehingga
-//     jadwal berikutnya melanjutkan dari part yang belum terposting.
-//  3. Pemindahan file & baca/tulis JSON dibuat tahan error supaya tidak
-//     memicu posting ulang setelah post sudah terbit.
-//  4. Item yang gagal 3 kali berturut-turut dipindah otomatis ke folder
-//     "failed" supaya tidak menahan antrean. Kegagalan karena kendala
-//     sistem (token/akun bermasalah, jaringan putus, rate limit, server
-//     error) TIDAK dihitung, supaya antrean tidak habis masuk "failed"
-//     gara-gara masalah sementara.
-//  5. (BARU) Lock file: kalau run sebelumnya masih berjalan (misal utas
-//     panjang), run yang baru dilewati supaya tidak terjadi posting dobel.
-//  6. (BARU) Nama file di R2 dibersihkan dari simbol yang merusak URL.
-//  7. (BARU) Utas yang sedang setengah jalan diprioritaskan sebelum item lain.
+// PERBAIKAN DI VERSI INI (dari hasil review):
+//  1. isSystemError sekarang juga mengenali error dari @aws-sdk/client-s3
+//     (Cloudflare R2) — sebelumnya cuma mengenali error axios/Threads.
+//     Tanpa ini, kredensial R2 salah / bucket belum publik akan dihitung
+//     sebagai kegagalan FILE (bisa masuk folder "failed" padahal filenya
+//     baik-baik saja, masalahnya di pengaturan R2).
+//  2. moveFilesToDir tidak pernah melempar error lagi (dibungkus try/catch
+//     di dalam). Sebelumnya, kalau proses pindah file gagal SETELAH post
+//     berhasil tayang, error itu naik dan dihitung sebagai kegagalan item —
+//     padahal postingannya sudah sukses.
+//  3. File "_reply" sekarang diambil dari part dengan nomor PALING BESAR
+//     yang punya file reply (sebelumnya berhenti di part pertama yang
+//     ketemu, karena ada "break").
+//  4. waitUntilFinished dan publishContainer sekarang diberi timeout,
+//     menyamakan dengan createContainer (sebelumnya tidak dibatasi,
+//     berisiko menggantung tanpa batas kalau koneksi macet).
+//  5. readJsonSafe sekarang mencadangkan file yang rusak ke ".bak" sebelum
+//     dipakai fallback kosong, supaya data lama tidak hilang percuma kalau
+//     file JSON rusak (misal proses mati saat menulis).
+//  6. (Tambahan, bukan dari 5 poin di atas) checkEnv() dikembalikan: cek
+//     variabel .env penting sebelum jalan, biar errornya jelas dari awal
+//     kalau kredensial belum lengkap, bukan error samar di tengah proses.
+//  7. (Kecil) R2_PUBLIC_URL_BASE dibersihkan dari garis miring di akhir,
+//     supaya URL hasil upload tidak dobel garis miring.
 
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const fs = require('fs');
@@ -33,49 +38,37 @@ const path = require('path');
 const axios = require('axios');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 
-// Ambil dari .env (diisi otomatis oleh app Threads Automator).
-// Kalau belum diisi (misal saat testing manual), pakai folder default
-// "queue" dan "posted" di dalam folder proyek ini.
-const QUEUE_DIR = process.env.QUEUE_FOLDER && process.env.QUEUE_FOLDER.trim() !== ''
-  ? process.env.QUEUE_FOLDER
-  : path.join(__dirname, 'queue');
-const POSTED_DIR = process.env.POSTED_FOLDER && process.env.POSTED_FOLDER.trim() !== ''
-  ? process.env.POSTED_FOLDER
-  : path.join(__dirname, 'posted');
+// Konfigurasi Folder & File
+const QUEUE_DIR = process.env.QUEUE_FOLDER || path.join(__dirname, 'queue');
+const POSTED_DIR = process.env.POSTED_FOLDER || path.join(__dirname, 'posted');
+const FAILED_DIR = path.join(__dirname, 'failed');
+
 const LOG_FILE = path.join(__dirname, 'thread-poster.log');
 const PENDING_REPLY_FILE = path.join(__dirname, 'pending-reply.json');
 const POSTED_INDEX_FILE = path.join(__dirname, 'posted-index.json');
-const THREAD_STATE_FILE = path.join(__dirname, 'thread-state.json'); // progres utas
-const FAILED_ITEMS_FILE = path.join(__dirname, 'failed-items.json'); // penghitung gagal
+const THREAD_STATE_FILE = path.join(__dirname, 'thread-state.json');
+const FAILED_ITEMS_FILE = path.join(__dirname, 'failed-items.json');
 const LOCK_FILE = path.join(__dirname, 'thread-poster.lock');
-const LOCK_STALE_MS = 2 * 60 * 60 * 1000; // lock dianggap basi setelah 2 jam
-// Folder untuk item bermasalah (dibuat otomatis kalau belum ada).
-// Bisa diubah lewat FAILED_FOLDER di .env, default: folder "failed" di samping skrip ini.
-const FAILED_DIR = process.env.FAILED_FOLDER && process.env.FAILED_FOLDER.trim() !== ''
-  ? process.env.FAILED_FOLDER
-  : path.join(__dirname, 'failed');
-const MAX_FAILURES = 3; // gagal berapa kali berturut-turut sebelum item dilewati
 
-const THREADS_USER_ID = process.env.THREADS_USER_ID;
-const THREADS_ACCESS_TOKEN = process.env.THREADS_ACCESS_TOKEN;
-const THREADS_API_BASE = 'https://graph.threads.net/v1.0';
+const MAX_FAILURES = 3;
+const DELAY_BETWEEN_PARTS_MS = 60 * 1000; // Jeda antar part (1 menit)
 const HTTP_TIMEOUT_MS = 60 * 1000;
-
-// Jeda antar part dalam 1 utas (milidetik). Ubah sesuai kebutuhan.
-const DELAY_BETWEEN_PARTS_MS = 60 * 1000; // 60 detik
 
 const IMAGE_EXTS = ['.jpg', '.jpeg', '.png'];
 const VIDEO_EXTS = ['.mp4'];
 
-// ====== KONFIGURASI CLOUDFLARE R2 (pengganti Cloudinary) ======
-// R2 kompatibel dengan S3 API, jadi dipanggil pakai library @aws-sdk/client-s3
-const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
-const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME;
+// Kredensial API
+const THREADS_USER_ID = process.env.THREADS_USER_ID;
+const THREADS_ACCESS_TOKEN = process.env.THREADS_ACCESS_TOKEN;
+const THREADS_API_BASE = 'https://graph.threads.net/v1.0';
+
+// PERBAIKAN 7: buang garis miring di akhir supaya URL tidak dobel "//"
 const R2_PUBLIC_URL_BASE = (process.env.R2_PUBLIC_URL_BASE || '').replace(/\/$/, '');
 
+// Inisialisasi Cloudflare R2
 const r2Client = new S3Client({
   region: 'auto',
-  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
     accessKeyId: process.env.R2_ACCESS_KEY_ID,
     secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
@@ -83,44 +76,28 @@ const r2Client = new S3Client({
 });
 
 // ====================================================
-// HELPER UMUM
+// FUNGSI BANTUAN (HELPER)
 // ====================================================
 function log(message) {
   const line = `[${new Date().toISOString()}] ${message}\n`;
   console.log(line.trim());
-  try {
-    fs.appendFileSync(LOG_FILE, line);
-  } catch (e) {
-    // jangan sampai gagal nulis log menghentikan proses
-  }
-}
-
-function randomMinutes(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
+  try { fs.appendFileSync(LOG_FILE, line); } catch (e) {}
 }
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Pesan error yang lebih informatif untuk error axios (isi balasan API ikut dicatat)
 function errMsg(err) {
-  if (err && err.response) {
-    let body = '';
-    try {
-      body = typeof err.response.data === 'string'
-        ? err.response.data
-        : JSON.stringify(err.response.data);
-    } catch (e) {
-      body = '';
-    }
-    return `${err.message} | ${body}`;
+  if (err && err.response && err.response.data) {
+    return typeof err.response.data === 'string' ? err.response.data : JSON.stringify(err.response.data);
   }
   return err && err.message ? err.message : String(err);
 }
 
-// Baca file JSON dengan aman. Kalau rusak, file lama dicadangkan (.bak)
-// supaya datanya tidak hilang tertimpa, lalu pakai nilai fallback.
+// PERBAIKAN 5: kalau file JSON rusak/tidak bisa diparse, cadangkan dulu ke
+// ".bak" sebelum dianggap kosong. Supaya data lama tidak hilang percuma
+// kalau nanti mau dicek manual apa yang rusak.
 function readJsonSafe(file, fallback) {
   if (!fs.existsSync(file)) return fallback;
   try {
@@ -129,17 +106,11 @@ function readJsonSafe(file, fallback) {
     return JSON.parse(raw);
   } catch (err) {
     log(`PERINGATAN: ${path.basename(file)} tidak bisa dibaca (${err.message}). Dicadangkan ke .bak`);
-    try {
-      fs.copyFileSync(file, `${file}.${Date.now()}.bak`);
-    } catch (e) {
-      // abaikan
-    }
+    try { fs.copyFileSync(file, `${file}.${Date.now()}.bak`); } catch (e) {}
     return fallback;
   }
 }
 
-// Tulis JSON secara atomik (tulis ke file sementara dulu, lalu rename)
-// supaya tidak setengah tertulis kalau proses mati mendadak.
 function writeJsonAtomic(file, data) {
   const tmp = `${file}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
@@ -147,354 +118,290 @@ function writeJsonAtomic(file, data) {
 }
 
 function readTextSafe(filePath) {
-  if (!filePath) return '';
-  try {
-    return fs.readFileSync(filePath, 'utf-8').trim();
-  } catch (err) {
-    log(`PERINGATAN: gagal membaca ${filePath}: ${err.message}`);
-    return '';
-  }
+  if (!filePath || !fs.existsSync(filePath)) return '';
+  try { return fs.readFileSync(filePath, 'utf-8').trim(); }
+  catch (err) { return ''; }
 }
 
 // ====================================================
-// LOCK: cegah dua proses thread-poster berjalan bersamaan (BARU)
+// CEK KELENGKAPAN .env (Tambahan)
 // ====================================================
-// Tiap jam posting adalah task terpisah di Task Scheduler. Kalau utas panjang
-// masih berjalan saat jam berikutnya tiba, tanpa lock dua proses akan memilih
-// item yang sama dan memposting dobel.
-let lockOwned = false;
+function checkEnv() {
+  const required = [
+    'THREADS_USER_ID', 'THREADS_ACCESS_TOKEN',
+    'R2_ACCOUNT_ID', 'R2_BUCKET_NAME', 'R2_PUBLIC_URL_BASE',
+    'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY',
+  ];
+  const missing = required.filter((k) => !process.env[k] || process.env[k].trim() === '');
+  if (missing.length > 0) {
+    log(`ERROR: variabel .env belum diisi: ${missing.join(', ')}`);
+    return false;
+  }
+  return true;
+}
 
+// ====================================================
+// SISTEM LOCK (Mencegah Bot Jalan Ganda)
+// ====================================================
+let lockOwned = false;
 function acquireLock() {
   try {
-    const fd = fs.openSync(LOCK_FILE, 'wx'); // gagal kalau file sudah ada
-    fs.writeSync(fd, String(Date.now()));
+    const fd = fs.openSync(LOCK_FILE, 'wx');
     fs.closeSync(fd);
     lockOwned = true;
     return true;
   } catch (err) {
-    if (err.code !== 'EEXIST') {
-      // Error lain (misal izin folder): jangan blokir posting, tapi catat.
-      log(`PERINGATAN: lock file tidak bisa dibuat (${err.message}), lanjut tanpa lock.`);
-      return true;
-    }
+    if (err.code !== 'EEXIST') return true; // Error izin, abaikan
     try {
       const age = Date.now() - fs.statSync(LOCK_FILE).mtimeMs;
-      if (age > LOCK_STALE_MS) {
-        log('Lock lama ditemukan (proses sebelumnya kemungkinan mati), diambil alih.');
+      if (age > 2 * 60 * 60 * 1000) { // Jika file lock sudah basi (2 jam)
         fs.writeFileSync(LOCK_FILE, String(Date.now()));
         lockOwned = true;
         return true;
       }
-    } catch (e) {
-      // lock hilang / tidak terbaca, anggap masih dipakai proses lain
-    }
+    } catch (e) {}
     return false;
   }
 }
 
 function releaseLock() {
   if (!lockOwned) return;
-  try {
-    fs.unlinkSync(LOCK_FILE);
-  } catch (e) {
-    // abaikan
-  }
+  try { fs.unlinkSync(LOCK_FILE); } catch (e) {}
   lockOwned = false;
 }
 
 // ====================================================
-// 0. STATE PROGRES UTAS
+// 1. SCAN FOLDER QUEUE & KELOMPOKKAN FILE
 // ====================================================
-// Bentuk: { "utas001": { lastPostId, doneParts: [1,2], captions: {"1":"..","2":".."} } }
-function loadThreadStates() {
-  const data = readJsonSafe(THREAD_STATE_FILE, {});
-  return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
-}
-
-function saveThreadStates(states) {
-  writeJsonAtomic(THREAD_STATE_FILE, states);
-}
-
-function getThreadState(threadId) {
-  const s = loadThreadStates()[threadId];
-  return {
-    lastPostId: s && s.lastPostId ? s.lastPostId : null,
-    doneParts: s && Array.isArray(s.doneParts) ? s.doneParts : [],
-    captions: s && s.captions && typeof s.captions === 'object' ? s.captions : {},
-  };
-}
-
-function setThreadState(threadId, state) {
-  const states = loadThreadStates();
-  states[threadId] = state;
-  saveThreadStates(states);
-}
-
-function clearThreadState(threadId) {
-  const states = loadThreadStates();
-  if (states[threadId]) {
-    delete states[threadId];
-    saveThreadStates(states);
-  }
-}
-
-// ====================================================
-// 1. BACA & KELOMPOKKAN ISI FOLDER QUEUE
-// ====================================================
+// Fitur ini otomatis mendeteksi apakah file tersebut Standalone, Utas, atau Carousel.
+// Aturan: nama[_partN][_slideN][_reply].ext
 function scanQueue() {
-  if (!fs.existsSync(QUEUE_DIR)) {
-    throw new Error(`Folder queue tidak ditemukan: ${QUEUE_DIR}`);
-  }
+  if (!fs.existsSync(QUEUE_DIR)) throw new Error(`Folder queue tidak ditemukan: ${QUEUE_DIR}`);
 
-  const allFiles = fs.readdirSync(QUEUE_DIR);
-  const threadGroups = {}; // { "utas001": { parts: { 1: {...}, 2: {...} }, earliestTime } }
-  const standaloneGroups = {}; // { "produk001": { txt, media, replyTxt, earliestTime } }
+  const groups = {};
 
-  const threadPattern = /^(utas\d+)_part(\d+)(_reply)?\.(txt|mp4|jpg|jpeg|png)$/i;
-
-  for (const fileName of allFiles) {
+  for (const fileName of fs.readdirSync(QUEUE_DIR)) {
     const fullPath = path.join(QUEUE_DIR, fileName);
-    let stat;
-    try {
-      stat = fs.statSync(fullPath);
-    } catch (e) {
-      continue; // file hilang/terkunci saat discan, lewati
+    if (!fs.statSync(fullPath).isFile()) continue;
+
+    const ext = path.extname(fileName).toLowerCase();
+    let baseName = path.basename(fileName, ext); // Buang ekstensi (misal: .jpg)
+
+    // Cek apakah ini file balasan affiliate
+    let isReply = false;
+    if (baseName.toLowerCase().endsWith('_reply')) {
+      isReply = true;
+      baseName = baseName.replace(/_reply$/i, '');
     }
-    if (!stat.isFile()) continue;
 
-    const threadMatch = fileName.match(threadPattern);
+    // Cek Nomor Slide (Carousel)
+    let slideNum = 1;
+    const slideMatch = baseName.match(/_slide(\d+)$/i);
+    if (slideMatch) {
+      slideNum = parseInt(slideMatch[1], 10);
+      baseName = baseName.replace(/_slide\d+$/i, '');
+    }
 
-    if (threadMatch) {
-      const [, threadId, partNumStr, isReply, ext] = threadMatch;
-      const partNum = parseInt(partNumStr, 10);
+    // Cek Nomor Part (Utas Berantai)
+    let partNum = 1;
+    const partMatch = baseName.match(/_part(\d+)$/i);
+    if (partMatch) {
+      partNum = parseInt(partMatch[1], 10);
+      baseName = baseName.replace(/_part\d+$/i, '');
+    }
 
-      if (!threadGroups[threadId]) threadGroups[threadId] = { parts: {}, earliestTime: stat.birthtime };
-      if (!threadGroups[threadId].parts[partNum]) threadGroups[threadId].parts[partNum] = {};
+    // Buat struktur objek jika belum ada
+    if (!groups[baseName]) {
+      groups[baseName] = { earliestTime: fs.statSync(fullPath).birthtime, parts: {} };
+    }
+    if (!groups[baseName].parts[partNum]) {
+      groups[baseName].parts[partNum] = { slides: [] };
+    }
 
-      if (isReply) {
-        threadGroups[threadId].parts[partNum].replyPath = fullPath;
-      } else if (ext.toLowerCase() === 'txt') {
-        threadGroups[threadId].parts[partNum].txtPath = fullPath;
-      } else {
-        threadGroups[threadId].parts[partNum].mediaPath = fullPath;
-        threadGroups[threadId].parts[partNum].mediaExt = '.' + ext.toLowerCase();
-      }
+    const partObj = groups[baseName].parts[partNum];
 
-      if (stat.birthtime < threadGroups[threadId].earliestTime) {
-        threadGroups[threadId].earliestTime = stat.birthtime;
-      }
-    } else {
-      // Standalone: kelompokkan berdasarkan nama file tanpa extension,
-      // dan tanpa akhiran "_reply"
-      const ext = path.extname(fileName).toLowerCase();
-      const isReply = fileName.toLowerCase().endsWith(`_reply${ext}`);
-      const baseName = isReply
-        ? path.basename(fileName, ext).replace(/_reply$/i, '')
-        : path.basename(fileName, ext);
-
-      if (!standaloneGroups[baseName]) {
-        standaloneGroups[baseName] = { earliestTime: stat.birthtime };
-      }
-      if (stat.birthtime < standaloneGroups[baseName].earliestTime) {
-        standaloneGroups[baseName].earliestTime = stat.birthtime;
-      }
-
-      if (isReply) {
-        standaloneGroups[baseName].replyPath = fullPath;
-      } else if (ext === '.txt') {
-        standaloneGroups[baseName].txtPath = fullPath;
-      } else if ([...IMAGE_EXTS, ...VIDEO_EXTS].includes(ext)) {
-        standaloneGroups[baseName].mediaPath = fullPath;
-        standaloneGroups[baseName].mediaExt = ext;
-      }
+    // Masukkan file ke tempat yang tepat
+    if (isReply) {
+      partObj.replyPath = fullPath;
+    } else if (ext === '.txt') {
+      partObj.txtPath = fullPath;
+    } else if (IMAGE_EXTS.includes(ext) || VIDEO_EXTS.includes(ext)) {
+      partObj.slides.push({ path: fullPath, ext, num: slideNum });
     }
   }
 
-  return { threadGroups, standaloneGroups };
+  // Rapikan urutan slide dari terkecil ke terbesar
+  for (const g of Object.values(groups)) {
+    for (const p of Object.values(g.parts)) {
+      p.slides.sort((a, b) => a.num - b.num);
+    }
+  }
+
+  return groups;
 }
 
-// ====================================================
-// 2. TENTUKAN ITEM BERIKUTNYA (FIFO lintas standalone & thread)
-// ====================================================
 function getNextItem() {
-  const { threadGroups, standaloneGroups } = scanQueue();
-  const states = loadThreadStates();
-
+  const groups = scanQueue();
+  const states = readJsonSafe(THREAD_STATE_FILE, {});
   const candidates = [];
 
-  for (const [id, group] of Object.entries(threadGroups)) {
-    // Utas dianggap layak diproses kalau masih ada part yang bisa diposting,
-    // ATAU ada progres tersimpan (artinya tinggal menyelesaikan/merapikan).
-    const hasPostablePart = Object.values(group.parts).some((p) => p.txtPath || p.mediaPath);
+  for (const [id, group] of Object.entries(groups)) {
+    const hasPostablePart = Object.values(group.parts).some(p => p.txtPath || p.slides.length > 0);
     if (!hasPostablePart && !states[id]) continue;
-    // Utas yang sudah setengah jalan diprioritaskan (waktu "paling lama")
-    // supaya diselesaikan dulu sebelum item lain, tidak menggantung.
-    candidates.push({
-      type: 'thread',
-      id,
-      group,
-      time: states[id] ? new Date(0) : group.earliestTime,
-    });
-  }
-  for (const [id, group] of Object.entries(standaloneGroups)) {
-    // butuh minimal txt ATAU media
-    if (!group.txtPath && !group.mediaPath) continue;
-    candidates.push({ type: 'standalone', id, group, time: group.earliestTime });
+
+    // Prioritaskan Utas yang sudah setengah jalan
+    candidates.push({ id, group, time: states[id] ? 0 : group.earliestTime });
   }
 
   if (candidates.length === 0) return null;
-
   candidates.sort((a, b) => a.time - b.time);
-  return candidates[0];
+  return candidates[0]; // Ambil antrean paling tua
 }
 
 // ====================================================
-// 3. UPLOAD MEDIA (kalau ada) KE CLOUDFLARE R2
+// 2. SISTEM CLOUDFLARE R2
 // ====================================================
 async function uploadMedia(mediaPath, ext) {
   const isVideo = VIDEO_EXTS.includes(ext);
-  log(`Uploading media ke Cloudflare R2 (${isVideo ? 'video' : 'image'}): ${mediaPath}`);
-
-  const fileBuffer = fs.readFileSync(mediaPath);
-  // Nama file dibersihkan dari simbol yang bisa merusak URL (spasi, #, ?, dll)
-  // dan diberi timestamp supaya unik antar upload.
   const safeName = path.basename(mediaPath).replace(/[^a-zA-Z0-9._-]/g, '_');
-  const objectKey = `threads-autopost/${Date.now()}-${safeName}`;
-  const contentType = isVideo ? 'video/mp4' : (ext === '.png' ? 'image/png' : 'image/jpeg');
+  const objectKey = `threads-auto/${Date.now()}-${safeName}`;
 
+  log(`Upload ke R2: ${path.basename(mediaPath)}...`);
   await r2Client.send(new PutObjectCommand({
-    Bucket: R2_BUCKET_NAME,
+    Bucket: process.env.R2_BUCKET_NAME,
     Key: objectKey,
-    Body: fileBuffer,
-    ContentType: contentType,
+    Body: fs.readFileSync(mediaPath),
+    ContentType: isVideo ? 'video/mp4' : (ext === '.png' ? 'image/png' : 'image/jpeg'),
   }));
 
-  const publicUrl = `${R2_PUBLIC_URL_BASE}/${objectKey}`;
-  log(`Upload selesai. URL: ${publicUrl}`);
-  return { url: publicUrl, isVideo, objectKey };
+  return { url: `${R2_PUBLIC_URL_BASE}/${objectKey}`, objectKey };
 }
 
-// Hapus file dari R2 setelah selesai dipakai, biar tidak numpuk storage.
-// Tidak pernah melempar error (kegagalan hapus tidak boleh menggagalkan posting).
 async function deleteFromR2(objectKey) {
   if (!objectKey) return;
   try {
-    await r2Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET_NAME, Key: objectKey }));
-    log(`File dihapus dari R2: ${objectKey}`);
+    await r2Client.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: objectKey }));
+    log(`[OK] File dihapus dari R2: ${objectKey}`);
   } catch (err) {
-    log(`GAGAL menghapus dari R2 (tidak fatal, dilanjutkan): ${errMsg(err)}`);
+    log(`[Peringatan] Gagal menghapus R2 (diabaikan): ${errMsg(err)}`);
   }
 }
 
 // ====================================================
-// 4. THREADS API: BUAT CONTAINER, TUNGGU, PUBLISH
+// 3. THREADS API
 // ====================================================
-async function createContainer({ text, mediaUrl, isVideo, replyToId }) {
-  const params = { access_token: THREADS_ACCESS_TOKEN };
-
-  if (mediaUrl) {
-    params.media_type = isVideo ? 'VIDEO' : 'IMAGE';
-    if (isVideo) params.video_url = mediaUrl;
-    else params.image_url = mediaUrl;
-  } else {
-    params.media_type = 'TEXT';
-  }
+async function createContainer({ text, media_type, mediaUrl, isCarouselItem, children, replyToId }) {
+  const params = { access_token: THREADS_ACCESS_TOKEN, media_type };
 
   if (text) params.text = text;
+  if (isCarouselItem) params.is_carousel_item = true;
+  if (children) params.children = children;
   if (replyToId) params.reply_to_id = replyToId;
 
+  if (mediaUrl) {
+    if (media_type === 'VIDEO') params.video_url = mediaUrl;
+    else params.image_url = mediaUrl;
+  }
+
   const res = await axios.post(`${THREADS_API_BASE}/${THREADS_USER_ID}/threads`, null, {
-    params,
-    timeout: HTTP_TIMEOUT_MS,
+    params, timeout: HTTP_TIMEOUT_MS
   });
-  log(`Container dibuat (${params.media_type}). ID: ${res.data.id}`);
   return res.data.id;
 }
 
-async function waitUntilFinished(containerId, maxAttempts = 30, delayMs = 10000) {
-  for (let i = 0; i < maxAttempts; i++) {
+// PERBAIKAN 4: tambah timeout, sebelumnya request ini tidak dibatasi waktu.
+async function waitUntilFinished(containerId) {
+  for (let i = 0; i < 30; i++) {
     const res = await axios.get(`${THREADS_API_BASE}/${containerId}`, {
       params: { fields: 'status,error_message', access_token: THREADS_ACCESS_TOKEN },
       timeout: HTTP_TIMEOUT_MS,
     });
-    const status = res.data.status;
-    if (status === 'FINISHED') return true;
-    if (status === 'ERROR') {
-      throw new Error(`Threads gagal memproses media (status: ERROR) ${res.data.error_message || ''}`.trim());
+
+    if (res.data.status === 'FINISHED') return true;
+    if (res.data.status === 'ERROR') {
+      throw new Error(`Threads gagal memproses media: ${res.data.error_message || ''}`);
     }
-    if (status === 'EXPIRED') {
-      throw new Error('Container media kedaluwarsa (status: EXPIRED)');
-    }
-    await sleep(delayMs);
+
+    log(`Menunggu media siap (Status: ${res.data.status})...`);
+    await sleep(10000); // Tunggu 10 detik sebelum cek lagi
   }
   throw new Error('Timeout menunggu media selesai diproses');
 }
 
+// PERBAIKAN 4: tambah timeout, sebelumnya request ini tidak dibatasi waktu.
 async function publishContainer(containerId) {
   const res = await axios.post(`${THREADS_API_BASE}/${THREADS_USER_ID}/threads_publish`, null, {
     params: { creation_id: containerId, access_token: THREADS_ACCESS_TOKEN },
     timeout: HTTP_TIMEOUT_MS,
   });
-  log(`Berhasil dipublish. Post ID: ${res.data.id}`);
   return res.data.id;
 }
 
-// Post 1 bagian (dipakai baik standalone maupun tiap part utas)
-// File di R2 dihapus lewat "finally", jadi tetap terhapus walaupun
-// createContainer / waitUntilFinished / publishContainer gagal.
-// Kalau gagal, file asli masih ada di folder queue dan akan diupload ulang
-// saat dicoba lagi di jadwal berikutnya.
-async function postOnePart({ text, mediaPath, mediaExt, replyToId }) {
-  let mediaUrl = null;
-  let isVideo = false;
-  let objectKey = null;
-
-  if (mediaPath) {
-    const uploaded = await uploadMedia(mediaPath, mediaExt);
-    mediaUrl = uploaded.url;
-    isVideo = uploaded.isVideo;
-    objectKey = uploaded.objectKey;
-  }
+// ====================================================
+// 4. LOGIKA POSTING (TEKS, SINGLE, CAROUSEL)
+// ====================================================
+async function postOnePart({ text, slides, replyToId }) {
+  let uploadedKeys = []; // Simpan data R2 untuk dihapus nanti
 
   try {
-    const containerId = await createContainer({ text, mediaUrl, isVideo, replyToId });
-
-    // Media butuh waktu diproses, teks biasanya instan
-    if (mediaUrl) {
-      await waitUntilFinished(containerId);
+    // KONDISI 1: Hanya Teks
+    if (slides.length === 0) {
+      log(`Membuat container (TEKS SAJA)...`);
+      const cid = await createContainer({ text, media_type: 'TEXT', replyToId });
+      return await publishContainer(cid);
     }
 
-    const postId = await publishContainer(containerId);
-    return postId;
+    // KONDISI 2: Single Media (1 Gambar/Video)
+    if (slides.length === 1) {
+      log(`Membuat container (SINGLE MEDIA)...`);
+      const s = slides[0];
+      const uploaded = await uploadMedia(s.path, s.ext);
+      uploadedKeys.push(uploaded.objectKey);
+
+      const media_type = VIDEO_EXTS.includes(s.ext) ? 'VIDEO' : 'IMAGE';
+      const cid = await createContainer({ text, media_type, mediaUrl: uploaded.url, replyToId });
+
+      await waitUntilFinished(cid);
+      return await publishContainer(cid);
+    }
+
+    // KONDISI 3: Carousel (Banyak Gambar/Video Slide)
+    if (slides.length > 10) throw new Error("Instagram/Threads membatasi maksimal 10 slide per post.");
+
+    log(`Membuat container (CAROUSEL - ${slides.length} SLIDE)...`);
+    let childrenIds = [];
+
+    // Upload dan buat container anak untuk tiap slide
+    for (const s of slides) {
+      const uploaded = await uploadMedia(s.path, s.ext);
+      uploadedKeys.push(uploaded.objectKey);
+
+      const media_type = VIDEO_EXTS.includes(s.ext) ? 'VIDEO' : 'IMAGE';
+      const childId = await createContainer({ media_type, mediaUrl: uploaded.url, isCarouselItem: true });
+
+      await waitUntilFinished(childId);
+      childrenIds.push(childId);
+    }
+
+    // Buat container induk (Carousel) yang mengikat anak-anaknya
+    const cid = await createContainer({ text, media_type: 'CAROUSEL', children: childrenIds.join(','), replyToId });
+    return await publishContainer(cid);
+
   } finally {
-    // Sampai di sini Threads sudah selesai mengambil file-nya (sukses),
-    // atau proses gagal dan file akan diupload ulang saat retry.
-    // Dua-duanya aman untuk menghapus file sementara di R2.
-    if (objectKey) {
-      await deleteFromR2(objectKey);
+    // BERHASIL ATAU GAGAL, file di R2 WAJIB dihapus agar kuota tidak penuh
+    for (const key of uploadedKeys) {
+      await deleteFromR2(key);
     }
   }
 }
 
 // ====================================================
-// 5. JADWALKAN REPLY LINK AFFILIATE (kalau ada file _reply)
+// 5. PROSES UTAMA (MENANGANI ITEM)
 // ====================================================
-function schedulePendingReply(postId, replyText) {
-  const delayMinutes = randomMinutes(15, 50);
-  const dueAt = new Date(Date.now() + delayMinutes * 60 * 1000);
-
-  let pending = readJsonSafe(PENDING_REPLY_FILE, []);
-  if (!Array.isArray(pending)) pending = [];
-  pending.push({ postId, replyText, dueAt: dueAt.toISOString(), done: false });
-  writeJsonAtomic(PENDING_REPLY_FILE, pending);
-  log(`Reply link dijadwalkan untuk post ${postId} pada ${dueAt.toISOString()} (${delayMinutes} menit lagi)`);
-}
-
-// ====================================================
-// 6. PINDAHKAN FILE-FILE YANG SUDAH DIPOSTING KE FOLDER POSTED
-// ====================================================
-// Tidak pernah melempar error: kalau gagal memindah SETELAH post terbit,
-// error tidak boleh membuat item dianggap gagal (nanti malah terposting ulang).
+// PERBAIKAN 2: dibungkus try/catch internal, TIDAK PERNAH melempar error.
+// Kalau gagal memindah file setelah post sudah tayang, itu cuma dicatat
+// sebagai peringatan di log — tidak boleh membuat item dianggap gagal
+// (nanti malah terposting ulang padahal sudah sukses tayang).
 function moveFilesToDir(destDir, filePaths) {
   try {
     if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
@@ -509,7 +416,7 @@ function moveFilesToDir(destDir, filePaths) {
     try {
       fs.renameSync(p, dest);
     } catch (err) {
-      // Fallback: salin lalu hapus (misal beda drive)
+      // Fallback jika beda partisi drive
       try {
         fs.copyFileSync(p, dest);
         fs.unlinkSync(p);
@@ -520,196 +427,95 @@ function moveFilesToDir(destDir, filePaths) {
   }
 }
 
-function moveFilesToPosted(filePaths) {
-  moveFilesToDir(POSTED_DIR, filePaths);
-}
+async function processItem(item) {
+  const { id, group } = item;
 
-// ====================================================
-// 7. PROSES: STANDALONE
-// ====================================================
-async function processStandalone(item) {
-  const { group, id } = item;
-  log(`Memproses standalone: ${id}`);
+  // Baca progres jika ini adalah kelanjutan Utas
+  const state = readJsonSafe(THREAD_STATE_FILE, {})[id] || { lastPostId: null, doneParts: [], captions: {} };
+  const partNumbers = Object.keys(group.parts).map(Number).sort((a, b) => a - b);
 
-  const text = readTextSafe(group.txtPath);
-
-  const postId = await postOnePart({
-    text,
-    mediaPath: group.mediaPath,
-    mediaExt: group.mediaExt,
-  });
-
-  // Post sudah terbit. Setelah ini tidak boleh ada yang melempar error.
-  moveFilesToPosted([group.txtPath, group.mediaPath, group.replyPath]);
-
-  log(`SELESAI standalone: ${id}`);
-  return postId;
-}
-
-// ====================================================
-// 8. PROSES: UTAS BERANTAI
-// ====================================================
-// Progres tiap part disimpan ke thread-state.json dan file part yang sukses
-// langsung dipindah ke "posted". Kalau utas gagal di tengah, jadwal berikutnya
-// MELANJUTKAN dari part yang belum terposting (reply-nya tetap nyambung ke
-// part terakhir yang sudah terbit), bukan mengulang dari part 1.
-async function processThread(item) {
-  const { group, id } = item;
-  const allPartNumbers = Object.keys(group.parts).map(Number).sort((a, b) => a - b);
-
-  const state = getThreadState(id);
-
-  // Rapikan: kalau ada part yang sudah tercatat sukses tapi file-nya masih
-  // di queue (proses sempat mati sebelum sempat memindah), pindahkan sekarang.
-  for (const n of allPartNumbers) {
-    if (state.doneParts.includes(n)) {
-      const p = group.parts[n];
-      moveFilesToPosted([p.txtPath, p.mediaPath]);
-    }
-  }
-
-  // Part yang perlu diposting: punya teks/media dan belum tercatat sukses
-  const pendingParts = allPartNumbers.filter((n) => {
-    const p = group.parts[n];
-    return (p.txtPath || p.mediaPath) && !state.doneParts.includes(n);
-  });
-
-  // File _reply: ambil dari part dengan nomor tertinggi yang punya _reply
+  // PERBAIKAN 3: cari file reply dari part dengan nomor PALING BESAR yang
+  // punya file reply (sebelumnya "break" di part pertama yang ketemu,
+  // jadi kalau ada beberapa file _reply, yang dipakai malah yang paling awal).
   let replyPath = null;
-  for (const n of allPartNumbers) {
+  for (const n of partNumbers) {
     if (group.parts[n].replyPath) replyPath = group.parts[n].replyPath;
   }
-  // Baca isinya SEKARANG (sebelum file dipindah) supaya tidak bergantung
-  // pada lokasi file nanti.
+  // Dibaca sekarang, sebelum file dipindah oleh proses posting di bawah.
   const replyText = readTextSafe(replyPath);
 
-  const totalParts = pendingParts.length + state.doneParts.length;
-  if (state.doneParts.length > 0) {
-    log(`Melanjutkan utas ${id}: ${state.doneParts.length} part sudah terbit, sisa ${pendingParts.length} part.`);
-  } else {
-    log(`Memproses utas: ${id} (${pendingParts.length} part)`);
-  }
-
-  let previousPostId = state.lastPostId; // null kalau utas baru
+  let previousPostId = state.lastPostId;
   let lastPostId = state.lastPostId;
 
-  let postedThisRun = 0;
-  try {
-    for (let i = 0; i < pendingParts.length; i++) {
-      const partNum = pendingParts[i];
-      const part = group.parts[partNum];
-      const text = readTextSafe(part.txtPath);
+  // Proses setiap Part
+  for (const n of partNumbers) {
+    const part = group.parts[n];
 
-      log(`Posting ${id} part ${partNum} (${state.doneParts.length + 1}/${totalParts})...`);
-
-      // Kalau ini gagal, error naik ke main; progres part sebelumnya sudah aman tersimpan.
-      const postId = await postOnePart({
-        text,
-        mediaPath: part.mediaPath,
-        mediaExt: part.mediaExt,
-        replyToId: previousPostId, // null untuk part pertama
-      });
-
-      previousPostId = postId;
-      lastPostId = postId;
-      postedThisRun++;
-
-      // Simpan progres DULU (paling penting), baru pindahkan file.
-      state.lastPostId = postId;
-      state.doneParts.push(partNum);
-      state.captions[String(partNum)] = text;
-      try {
-        setThreadState(id, state);
-      } catch (err) {
-        // Kalau progres gagal tersimpan, lanjutkan saja (utas tetap tersambung
-        // di run ini), tapi catat peringatan.
-        log(`PERINGATAN: gagal menyimpan progres utas ${id}: ${err.message}`);
-      }
-      moveFilesToPosted([part.txtPath, part.mediaPath]);
-
-      // Jeda antar part, kecuali setelah part terakhir
-      if (i < pendingParts.length - 1) {
-        log(`Menunggu ${DELAY_BETWEEN_PARTS_MS / 1000} detik sebelum part berikutnya...`);
-        await sleep(DELAY_BETWEEN_PARTS_MS);
-      }
+    // Rapikan file part yang sudah sukses sebelumnya
+    if (state.doneParts.includes(n)) {
+      moveFilesToDir(POSTED_DIR, [part.txtPath, ...part.slides.map(s => s.path)]);
+      continue;
     }
-  } catch (err) {
-    // Tandai kalau run ini sempat menerbitkan part (berarti ada kemajuan,
-    // bukan macet di tempat yang sama).
-    if (err && typeof err === 'object') err.madeProgress = postedThisRun > 0;
-    throw err;
+
+    if (!part.txtPath && part.slides.length === 0) continue;
+
+    const text = readTextSafe(part.txtPath);
+    log(`Memposting [${id}] part ${n}...`);
+
+    // Posting Part ini
+    const postId = await postOnePart({ text, slides: part.slides, replyToId: previousPostId });
+
+    previousPostId = postId;
+    lastPostId = postId;
+
+    // Simpan Progres Utas
+    state.lastPostId = postId;
+    state.doneParts.push(n);
+    state.captions[String(n)] = text;
+
+    const allStates = readJsonSafe(THREAD_STATE_FILE, {});
+    allStates[id] = state;
+    writeJsonAtomic(THREAD_STATE_FILE, allStates);
+
+    // Pindah file ke folder Posted (tidak akan melempar error, lihat PERBAIKAN 2)
+    moveFilesToDir(POSTED_DIR, [part.txtPath, ...part.slides.map(s => s.path)]);
+
+    // Jeda antar part (kecuali part terakhir)
+    if (n !== partNumbers[partNumbers.length - 1]) {
+      log(`Menunggu ${DELAY_BETWEEN_PARTS_MS / 1000} detik sebelum part selanjutnya...`);
+      await sleep(DELAY_BETWEEN_PARTS_MS);
+    }
   }
 
-  if (!lastPostId) {
-    throw new Error(`Utas ${id} tidak punya part yang bisa diposting`);
-  }
+  if (!lastPostId) throw new Error(`Tidak ada konten valid untuk diposting dari ${id}`);
 
-  // Semua part terbit. Rapikan file reply dan hapus progres.
-  moveFilesToPosted([replyPath]);
-  // Pindahkan juga sisa file _reply dari part lain kalau ada
-  for (const n of allPartNumbers) {
-    const rp = group.parts[n].replyPath;
-    if (rp && rp !== replyPath) moveFilesToPosted([rp]);
-  }
+  // Semua sukses! Bersihkan file Reply dan State Utas
+  moveFilesToDir(POSTED_DIR, partNumbers.map(n => group.parts[n].replyPath).filter(Boolean));
 
-  const captionText = Object.keys(state.captions)
-    .map(Number)
-    .sort((a, b) => a - b)
-    .map((n) => state.captions[String(n)] || '')
-    .join(' | ');
+  const allStatesFinal = readJsonSafe(THREAD_STATE_FILE, {});
+  delete allStatesFinal[id];
+  writeJsonAtomic(THREAD_STATE_FILE, allStatesFinal);
 
-  try {
-    clearThreadState(id);
-  } catch (err) {
-    log(`PERINGATAN: gagal menghapus progres utas ${id}: ${err.message}`);
-  }
+  const fullCaption = Object.values(state.captions).join(' | ');
+  log(`[SUKSES] ${id} terposting. Post ID Akhir: ${lastPostId}`);
 
-  log(`SELESAI utas: ${id}, total ${totalParts} part terposting.`);
-  return { lastPostId, hasReply: !!replyPath, replyText, captionText };
+  return { postId: lastPostId, captionText: fullCaption, isJualan: !!replyPath, replyText };
 }
 
 // ====================================================
-// 9. CATAT POST YANG TAYANG KE posted-index.json
-//    (dipakai comment-responder.js buat tau jenis post & captionnya)
+// 6. MAIN & ERROR HANDLING
 // ====================================================
-function recordPostedIndex({ postId, type, captionText }) {
-  let index = readJsonSafe(POSTED_INDEX_FILE, []);
-  if (!Array.isArray(index)) index = [];
-  index.push({
-    postId,
-    type, // 'jualan' atau 'nonjualan'
-    captionText: captionText || '',
-    postedAt: new Date().toISOString(),
-  });
-  writeJsonAtomic(POSTED_INDEX_FILE, index);
-  log(`Dicatat ke posted-index.json: ${postId} (${type})`);
-}
-
-// Pencatatan setelah post terbit: kalau gagal, cukup dicatat di log.
-// Post sudah terbit, jadi TIDAK boleh dianggap gagal (nanti terposting ulang).
-function afterPostBookkeeping({ postId, isJualan, captionText, replyText }) {
-  try {
-    recordPostedIndex({ postId, type: isJualan ? 'jualan' : 'nonjualan', captionText });
-  } catch (err) {
-    log(`PERINGATAN: gagal mencatat posted-index untuk ${postId}: ${err.message}`);
-  }
-
-  if (isJualan) {
-    if (!replyText) {
-      log(`PERINGATAN: post ${postId} bertipe jualan tapi isi _reply kosong/tidak terbaca, reply tidak dijadwalkan.`);
-      return;
-    }
-    try {
-      schedulePendingReply(postId, replyText);
-    } catch (err) {
-      log(`PERINGATAN: gagal menjadwalkan reply untuk ${postId}: ${err.message}`);
-    }
-  }
-}
-
-// ====================================================
-// 10. PENGHITUNG GAGAL & FOLDER "failed"
-// ====================================================
+// PERBAIKAN 1: sebelumnya cuma mengenali bentuk error axios/Threads
+// (err.response.status, err.code, err.name generik). Sekarang juga
+// mengenali bentuk error dari @aws-sdk/client-s3 (Cloudflare R2):
+//   - err.$metadata.httpStatusCode  -> status HTTP asli dari AWS SDK v3
+//   - err.name                     -> nama exception, misal "AccessDenied",
+//                                      "InvalidAccessKeyId",
+//                                      "SignatureDoesNotMatch",
+//                                      "CredentialsProviderError",
+//                                      "NoSuchBucket"
+// Tanpa ini, kredensial/bucket R2 yang salah akan dihitung sebagai
+// kegagalan FILE, bukan kegagalan sistem.
 const NETWORK_ERROR_CODES = [
   'ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'ENOTFOUND',
   'EAI_AGAIN', 'ECONNREFUSED', 'EPIPE', 'ENETUNREACH',
@@ -720,10 +526,6 @@ const SYSTEM_AWS_NAMES = [
   'AccessDenied', 'NoSuchBucket', 'TimeoutError',
 ];
 
-// Kegagalan yang BUKAN salah item (token/akun, jaringan, rate limit, server error,
-// kredensial/bucket R2). Ini tidak dihitung, karena masalahnya sementara atau
-// ada di pengaturan, bukan di file itu. Kalau dihitung, semua item di antrean
-// bisa ikut terlempar ke "failed" hanya karena token habis atau internet putus.
 function isSystemError(err) {
   if (!err) return false;
 
@@ -736,6 +538,7 @@ function isSystemError(err) {
 
   if (!err.response && err.code && NETWORK_ERROR_CODES.includes(err.code)) return true;
 
+  // Bentuk error khas AWS SDK v3 (dipakai @aws-sdk/client-s3 untuk R2)
   const awsStatus = err.$metadata && err.$metadata.httpStatusCode;
   if (awsStatus === 401 || awsStatus === 403 || awsStatus >= 500) return true;
   if (err.name && SYSTEM_AWS_NAMES.includes(err.name)) return true;
@@ -743,159 +546,89 @@ function isSystemError(err) {
   return false;
 }
 
-// Catat 1 kegagalan untuk item ini, kembalikan total hitungan sekarang.
-function recordFailure(key, err) {
-  try {
-    const all = readJsonSafe(FAILED_ITEMS_FILE, {});
-    const data = all && typeof all === 'object' && !Array.isArray(all) ? all : {};
-    const count = (data[key] && data[key].count ? data[key].count : 0) + 1;
-    data[key] = {
-      count,
-      lastError: errMsg(err).slice(0, 500),
-      lastAt: new Date().toISOString(),
-    };
-    writeJsonAtomic(FAILED_ITEMS_FILE, data);
-    return count;
-  } catch (e) {
-    log(`PERINGATAN: gagal menyimpan failed-items.json: ${e.message}`);
-    return 0; // 0 = jangan sampai salah memindahkan item kalau penghitung rusak
-  }
-}
-
-function clearFailure(key) {
-  try {
-    const all = readJsonSafe(FAILED_ITEMS_FILE, {});
-    if (all && typeof all === 'object' && all[key]) {
-      delete all[key];
-      writeJsonAtomic(FAILED_ITEMS_FILE, all);
-    }
-  } catch (e) {
-    log(`PERINGATAN: gagal mereset penghitung gagal ${key}: ${e.message}`);
-  }
-}
-
-// Kumpulkan semua file item yang MASIH ada di folder queue
-function collectItemFiles(item) {
-  const g = item.group;
-  if (item.type === 'standalone') {
-    return [g.txtPath, g.mediaPath, g.replyPath];
-  }
-  const files = [];
-  for (const p of Object.values(g.parts)) {
-    files.push(p.txtPath, p.mediaPath, p.replyPath);
-  }
-  return files;
-}
-
-function quarantineItem(item, key) {
-  moveFilesToDir(FAILED_DIR, collectItemFiles(item));
-  clearFailure(key);
-  log(`ITEM DILEWATI: ${item.id} gagal ${MAX_FAILURES}x berturut-turut. File dipindah ke folder failed: ${FAILED_DIR}`);
-  if (item.type === 'thread') {
-    log(`Catatan: part ${item.id} yang sudah terbit tetap tercatat di thread-state.json. Kalau file dikembalikan ke queue, utas dilanjutkan dari part yang belum terbit.`);
-  }
-}
-
-// ====================================================
-// MAIN
-// ====================================================
-function checkEnv() {
-  const required = [
-    'THREADS_USER_ID',
-    'THREADS_ACCESS_TOKEN',
-    'R2_ACCOUNT_ID',
-    'R2_BUCKET_NAME',
-    'R2_PUBLIC_URL_BASE',
-    'R2_ACCESS_KEY_ID',
-    'R2_SECRET_ACCESS_KEY',
-  ];
-  const missing = required.filter((k) => !process.env[k] || process.env[k].trim() === '');
-  if (missing.length > 0) {
-    log(`ERROR: variabel .env belum diisi: ${missing.join(', ')}`);
-    return false;
-  }
-  return true;
-}
-
-async function run() {
+async function main() {
   log('=== Menjalankan thread-poster ===');
 
   if (!checkEnv()) return;
 
-  let item;
-  try {
-    item = getNextItem();
-  } catch (err) {
-    log(`ERROR saat membaca queue: ${err.message}`);
-    return;
-  }
-
-  if (!item) {
-    log('Tidak ada item di folder queue. Selesai.');
+  if (!acquireLock()) {
+    log('Proses bot sebelumnya masih berjalan. Run ini dilewati.');
     return;
   }
 
   try {
-    if (item.type === 'standalone') {
-      // Baca teks caption & reply SEBELUM file dipindah
-      const captionText = readTextSafe(item.group.txtPath);
-      const isJualan = !!item.group.replyPath;
-      const replyText = isJualan ? readTextSafe(item.group.replyPath) : '';
-
-      const postId = await processStandalone(item);
-
-      afterPostBookkeeping({ postId, isJualan, captionText, replyText });
-      clearFailure(`${item.type}:${item.id}`);
-    } else {
-      const { lastPostId, hasReply, replyText, captionText } = await processThread(item);
-
-      // Catat post terakhir utas ke index (dengan gabungan caption semua part sebagai konteks)
-      afterPostBookkeeping({
-        postId: lastPostId,
-        isJualan: hasReply,
-        captionText,
-        replyText,
-      });
-      clearFailure(`${item.type}:${item.id}`);
-    }
-  } catch (err) {
-    const key = `${item.type}:${item.id}`;
-    log(`GAGAL memproses ${item.id}: ${errMsg(err)}`);
-
-    // Kendala sistem (token, jaringan, rate limit, server, kredensial R2):
-    // bukan salah item, jadi tidak dihitung. Dicoba lagi di jadwal berikutnya.
-    if (isSystemError(err)) {
-      log('Kendala sistem/jaringan/akun (bukan salah item), TIDAK dihitung sebagai kegagalan item. Dicoba lagi di jadwal berikutnya.');
+    let item;
+    try {
+      item = getNextItem();
+    } catch (err) {
+      log(`ERROR saat membaca queue: ${errMsg(err)}`);
       return;
     }
 
-    // Utas yang sempat menerbitkan part di run ini berarti ada kemajuan,
-    // jadi hitungan gagalnya dimulai lagi dari awal.
-    if (err && err.madeProgress) clearFailure(key);
-
-    const count = recordFailure(key, err);
-    if (count >= MAX_FAILURES) {
-      quarantineItem(item, key);
-    } else {
-      if (item.type === 'thread') {
-        log('Part yang sudah terbit tercatat di thread-state.json; jadwal berikutnya melanjutkan dari part yang belum terposting.');
-      } else {
-        log('File dibiarkan di folder queue, akan dicoba lagi di jadwal berikutnya.');
-      }
-      if (count > 0) log(`Kegagalan ke-${count} dari ${MAX_FAILURES} untuk ${item.id}.`);
+    if (!item) {
+      log('Tidak ada item di folder queue. Selesai.');
+      return;
     }
-  }
-}
 
-// Pembungkus: pastikan hanya satu proses yang berjalan pada satu waktu,
-// dan lock selalu dilepas walaupun terjadi error.
-async function main() {
-  if (!acquireLock()) {
-    log('Proses thread-poster lain masih berjalan, run ini dilewati.');
-    return;
-  }
-  try {
-    await run();
+    try {
+      const result = await processItem(item);
+
+      // 1. Catat ke Dashboard UI (posted-index.json)
+      let index = readJsonSafe(POSTED_INDEX_FILE, []);
+      if (!Array.isArray(index)) index = [];
+      index.push({
+        postId: result.postId,
+        type: result.isJualan ? 'jualan' : 'nonjualan',
+        captionText: result.captionText,
+        postedAt: new Date().toISOString()
+      });
+      writeJsonAtomic(POSTED_INDEX_FILE, index);
+
+      // 2. Jadwalkan Reply Link Affiliate
+      if (result.isJualan && result.replyText) {
+        let pending = readJsonSafe(PENDING_REPLY_FILE, []);
+        if (!Array.isArray(pending)) pending = [];
+        const delayMins = Math.floor(Math.random() * (50 - 15 + 1)) + 15;
+        pending.push({
+          postId: result.postId,
+          replyText: result.replyText,
+          dueAt: new Date(Date.now() + delayMins * 60000).toISOString(),
+          done: false
+        });
+        writeJsonAtomic(PENDING_REPLY_FILE, pending);
+        log(`Reply affiliate dijadwalkan ${delayMins} menit dari sekarang.`);
+      }
+
+      // 3. Bersihkan hitungan gagal (kalau ada)
+      const fails = readJsonSafe(FAILED_ITEMS_FILE, {});
+      if (fails[item.id]) { delete fails[item.id]; writeJsonAtomic(FAILED_ITEMS_FILE, fails); }
+
+    } catch (err) {
+      log(`[GAGAL] memproses ${item.id}: ${errMsg(err)}`);
+
+      // Jika masalah jaringan/kuota/kredensial R2, jangan salahkan file-nya
+      if (isSystemError(err)) {
+        log('Kendala server/jaringan/kredensial (bukan salah file). File aman, akan dicoba lagi di jadwal berikutnya.');
+        return;
+      }
+
+      // Jika salah file-nya (format rusak dll), hitung kegagalan
+      const fails = readJsonSafe(FAILED_ITEMS_FILE, {});
+      fails[item.id] = { count: (fails[item.id]?.count || 0) + 1, err: errMsg(err).slice(0, 500) };
+      writeJsonAtomic(FAILED_ITEMS_FILE, fails);
+
+      if (fails[item.id].count >= MAX_FAILURES) {
+        // Pindah ke folder failed
+        let allFiles = [];
+        for (const p of Object.values(item.group.parts)) {
+          allFiles.push(p.txtPath, p.replyPath, ...p.slides.map(s => s.path));
+        }
+        moveFilesToDir(FAILED_DIR, allFiles);
+        log(`[DIPINDAHKAN] ${item.id} gagal ${MAX_FAILURES}x berturut-turut. Dipindah ke folder failed.`);
+      } else {
+        log(`Kegagalan ke-${fails[item.id].count} dari ${MAX_FAILURES} untuk ${item.id}.`);
+      }
+    }
   } finally {
     releaseLock();
   }
