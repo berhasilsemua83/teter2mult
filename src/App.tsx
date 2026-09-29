@@ -337,7 +337,22 @@ export default function App() {
       setApplying(false);
     }
   }
-
+async function handleDisableSchedule() {
+    if (!confirm(`Matikan bot untuk profil "${config.name}"? Jadwal tidak akan berjalan sampai Anda menerapkannya lagi.`)) return;
+    
+    setApplying(true);
+    setScheduleLog([]);
+    setStatus("Mematikan bot...");
+    try {
+      const msg = await invoke<string>("disable_schedule", { profileName: config.name });
+      setScheduleLog([`[OFF] ${msg}`]);
+      setStatus("Bot dinonaktifkan.");
+    } catch (err) {
+      setStatus(`Gagal mematikan bot: ${err}`);
+    } finally {
+      setApplying(false);
+    }
+  }
   async function handleDetectNode() {
     try {
       const path = await invoke<string>("detect_node_path");
