@@ -233,19 +233,25 @@ async function main() {
 
       let replyText = null;
 
-      try {
+try {
+        // 1. Cek apakah ini post jualan (Cari kata kunci dulu)
         if (post.type === 'jualan') {
           replyText = matchTriggerRule(comment.text);
-          if (!replyText) {
-            log('Tidak cocok trigger manapun, di-skip (post jualan).');
-            continue;
+        }
+
+        // 2. SISTEM HYBRID: 
+        // Jika bukan jualan, ATAU jualan tapi tidak cocok kata kunci, lempar ke AI!
+        if (!replyText) {
+          if (post.type === 'jualan') {
+            log(`[HYBRID] Komen tidak cocok trigger jualan, melempar ke AI Gemini...`);
           }
-        } else {
           replyText = await generateAiReply(post.captionText, comment.text);
-          if (!replyText) {
-            log('AI tidak menghasilkan balasan, di-skip.');
-            continue;
-          }
+        }
+
+        // 3. Jika AI juga gagal (misal API limit) atau kosong, baru di-skip
+        if (!replyText) {
+          log('Tidak ada balasan yang terbuat (AI gagal / Trigger kosong), di-skip.');
+          continue;
         }
 
         await sendReply(replyText, comment.id);
